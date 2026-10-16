@@ -2,149 +2,227 @@
 #!/usr/bin/env bash
 
 # CEH DNS Domain / DNS Tree Name Finder
-# Usage: sudo ./dns_domainname_finder.sh <target-ip>
+# Use only against systems you own or are authorized to assess.
+# Usage:
+#   ./hi.sh <target-IP-or-hostname> [AD-domain]
+# Examples:
+#   ./hi.sh scanme.nmap.org
+#   ./hi.sh 192.168.10.222 skill.ceh.com
 
-set -uo pipefail
+set -u
 
-TARGET="${1:-}"
-
-if [[ -z "$TARGET" ]]; then
-    echo "Usage: sudo $0 <target-ip>"
-    echo "Example: sudo $0 192.168.10.222"
-    exit 1
+# ---------- Colors ----------
+if [[ -t 1 ]]; then
+    GREEN=$'\033[0;32m'
+    YELLOW=$'\033[1;33m'
+    RED=$'\033[0;31m'
+    CYAN=$'\033[0;36m'
+    RESET=$'\033[0m'
+else
+    GREEN='' YELLOW='' RED='' CYAN='' RESET=''
 fi
 
-if ! command -v nmap >/dev/null 2>&1; then
-    echo "[ERROR] Nmap is not installed."
-    echo "Install with: sudo apt install nmap"
-    exit 1
-fi
-
-if ! command -v grep >/dev/null 2>&1; then
-    echo "[ERROR] grep is required."
-    exit 1
-fi
-
-WORKDIR="$(mktemp -d)" || exit 1
-trap 'rm -rf "$WORKDIR"' EXIT
-
-HOST_OUT="$WORKDIR/host.txt"
-NB_OUT="$WORKDIR/netbios.txt"
-SMB_OUT="$WORKDIR/smb.txt"
-LDAP_OUT="$WORKDIR/ldap.txt"
-DNS_OUT="$WORKDIR/dns.txt"
-
-run_scan() {
-    local title="$1"
-    local outfile="$2"
-    shift 2
-
-    echo
-    echo "=================================================="
-    echo "$title"
-    echo "=================================================="
-
-    "$@" -oN "$outfile" 
-    local rc=$?
-
-    if [[ -f "$outfile" ]]; then
-        cat "$outfile"
-    fi
-
-    if (( rc != 0 )); then
-        echo "[WARNING] Scan returned status $rc."
-    fi
+banner() {
+    printf '\n%s\n' "=================================================="
+    printf '%s\n' "$1"
+    printf '%s\n' "=================================================="
 }
 
-echo "=========================================="
+# ---------- Validate arguments ----------
+if [[ $# -lt 1 || $# -gt 2 || -z "${1:-}" ]]; then
+    echo "Usage: $0 <target-IP-or-hostname> [AD-domain]"
+    echo "Example: $0 192.168.10.222 skill.ceh.com"
+    exit 1
+fi
+
+TARGET="$1"
+DOMAIN="${2:-}"
+
+if ! command -v nmap >/dev/null 2>&1; then
+    echo "${RED}ERROR: Nmap is not installed.${RESET}"
+    echo "Install: sudo apt update && sudo apt install nmap"
+    exit 1
+fi
+
+# If no separate domain was supplied, use a hostname as the
+# candidate DNS domain. For an IP target, DNS SRV checks are skipped.
+if [[ -z "$DOMAIN" && "$TARGET" == *.* && ! "$TARGET" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    DOMAIN="$TARGET"
+fi
+
+# ---------- Persistent report folder ----------
+STAMP=$(date +%Y%m%d_%H%M%S)
+REPORT_DIR="$PWD/hi_report_$STAMP"
+
+if ! mkdir -p "$REPORT_DIR"; then
+    echo "${RED}ERROR: Cannot create report directory.${RESET}"
+    exit 1
+fi
+
+echo "=================================================="
 echo " CEH DNS DOMAIN / DNS TREE NAME FINDER"
-echo "=========================================="
-echo "Target: $TARGET"
-echo
-
-# STEP 1: Host discovery
-run_scan "STEP 1: HOST DISCOVERY" "$HOST_OUT" \
-    nmap -n -sn "$TARGET"
-
-# STEP 2: NetBIOS discovery
-# UDP 137 commonly requires root privileges.
-run_scan "STEP 2: NETBIOS DISCOVERY (UDP 137)" "$NB_OUT" \
-    nmap -n -Pn -sU -p 137 --script nbstat "$TARGET"
-
-# STEP 3: SMB discovery
-run_scan "STEP 3: SMB OS / DOMAIN DISCOVERY" "$SMB_OUT" \
-    nmap -n -Pn -p 139,445 --script smb-os-discovery "$TARGET"
-
-# STEP 4: LDAP RootDSE discovery
-# Anonymous RootDSE queries may be allowed even when
-# ordinary LDAP directory searches require authentication.
-run_scan "STEP 4: LDAP ROOTDSE DISCOVERY" "$LDAP_OUT" \
-    nmap -n -Pn -p 389,636 --script ldap-rootdse "$TARGET"
-
-# STEP 5: DNS service check
-run_scan "STEP 5: DNS SERVICE CHECK" "$DNS_OUT" \
-    nmap -n -Pn -sT -p 53 -sV "$TARGET"
-
-echo
 echo "=================================================="
-echo " STEP 6: EXTRACTED DOMAIN INFORMATION"
-echo "=================================================="
+echo "Target:  $TARGET"
+echo "Domain:  ${DOMAIN:-Not supplied}"
+echo "Shell:   $BASH_VERSION"
+echo "Reports: $REPORT_DIR"
+echo "Nmap:    $(nmap --version | head -n 1)"
+
+# ---------- Step 1: Host discovery ----------
+banner "STEP 1: HOST DISCOVERY"
+
+if nmap -n -sn -oN "$REPORT_DIR/host.txt" "$TARGET"; then
+    echo "${GREEN}Host discovery completed.${RESET}"
+else
+    echo "${YELLOW}Host discovery returned an error; see host.txt.${RESET}"
+fi
+
+# ---------- Step 2: NetBIOS ----------
+banner "STEP 2: NETBIOS DISCOVERY (UDP 137)"
+
+if nmap -n -Pn -sU -p 137 --script nbstat \
+    --host-timeout 60s \
+    -oN "$REPORT_DIR/netbios.txt" "$TARGET"; then
+    echo "${GREEN}NetBIOS scan completed.${RESET}"
+else
+    echo "${YELLOW}NetBIOS scan returned an error.${RESET}"
+fi
+
+# ---------- Step 3: SMB ----------
+banner "STEP 3: SMB OS / DOMAIN DISCOVERY"
+
+if nmap -n -Pn -p 139,445 --script smb-os-discovery \
+    --host-timeout 60s \
+    -oN "$REPORT_DIR/smb.txt" "$TARGET"; then
+    echo "${GREEN}SMB scan completed.${RESET}"
+else
+    echo "${YELLOW}SMB scan returned an error.${RESET}"
+fi
+
+# ---------- Step 4: LDAP RootDSE ----------
+banner "STEP 4: LDAP ROOTDSE DISCOVERY"
+
+if nmap -n -Pn -p 389,636 --script ldap-rootdse \
+    --host-timeout 60s \
+    -oN "$REPORT_DIR/ldap.txt" "$TARGET"; then
+    echo "${GREEN}LDAP scan completed.${RESET}"
+else
+    echo "${YELLOW}LDAP scan returned an error.${RESET}"
+fi
+
+# ---------- Step 5: DNS TCP/53 ----------
+banner "STEP 5: DNS TCP PORT CHECK"
+
+if nmap -n -Pn -sT -p 53 -sV --version-light \
+    --host-timeout 60s \
+    -oN "$REPORT_DIR/dns-port.txt" "$TARGET"; then
+    echo "${GREEN}DNS TCP port check completed.${RESET}"
+else
+    echo "${YELLOW}DNS port check returned an error.${RESET}"
+fi
+
+# ---------- Step 6: DNS SRV records ----------
+banner "STEP 6: ACTIVE DIRECTORY DNS SRV DISCOVERY"
+
+if [[ -n "$DOMAIN" ]]; then
+    if command -v dig >/dev/null 2>&1; then
+        for RECORD in \
+            "_ldap._tcp.dc._msdcs.$DOMAIN" \
+            "_ldap._tcp.$DOMAIN" \
+            "_kerberos._tcp.$DOMAIN"; do
+
+            SAFE_NAME="${RECORD//[^a-zA-Z0-9_.-]/_}"
+            OUT="$REPORT_DIR/srv_${SAFE_NAME}.txt"
+
+            echo
+            echo "Query: $RECORD"
+
+            if dig +time=3 +tries=1 +noall +answer \
+                "$RECORD" SRV > "$OUT"; then
+                if [[ -s "$OUT" ]]; then
+                    cat "$OUT"
+                else
+                    echo "No SRV answer returned."
+                fi
+            else
+                echo "DNS query failed; inspect $OUT."
+            fi
+        done
+    else
+        echo "dig is unavailable. Install it with:"
+        echo "sudo apt install dnsutils"
+    fi
+else
+    echo "No DNS domain supplied; skipping SRV queries."
+    echo "For an IP target, run: ./hi.sh <DC-IP> <AD-domain>"
+fi
+
+# ---------- Step 7: Extract reported fields ----------
+banner "STEP 7: EXTRACTED DOMAIN INFORMATION"
 
 echo
-echo "--- SMB domain / computer fields ---"
-if ! grep -Ei \
-    'Computer name:|NetBIOS computer name:|Domain name:|Forest name:|FQDN:|Workgroup:|OS:' \
-    "$SMB_OUT"; then
-    echo "No SMB domain fields were returned."
+echo "--- SMB fields ---"
+if grep -Eiq \
+    'NetBIOS computer name:|NetBIOS domain name:|DNS domain name:|FQDN:|OS:|System time:' \
+    "$REPORT_DIR/smb.txt"; then
+    grep -Ei \
+        'NetBIOS computer name:|NetBIOS domain name:|DNS domain name:|FQDN:|OS:|System time:' \
+        "$REPORT_DIR/smb.txt"
+else
+    echo "No SMB domain/computer fields found."
 fi
 
 echo
 echo "--- LDAP RootDSE fields ---"
-if ! grep -Ei \
-    'dnsHostName|defaultNamingContext|rootDomainNamingContext|namingContexts|domainFunctionality|forestFunctionality|serverName|ldap-rootdse' \
-    "$LDAP_OUT"; then
-    echo "No LDAP RootDSE fields were returned."
+if grep -Eiq \
+    'rootDomainNamingContext|defaultNamingContext|namingContexts|dnsHostName|ldapServiceName|domainFunctionality|forestFunctionality' \
+    "$REPORT_DIR/ldap.txt"; then
+    grep -Ei \
+        'rootDomainNamingContext|defaultNamingContext|namingContexts|dnsHostName|ldapServiceName|domainFunctionality|forestFunctionality' \
+        "$REPORT_DIR/ldap.txt"
+else
+    echo "No LDAP RootDSE fields found."
 fi
 
 echo
-echo "--- NetBIOS fields ---"
-if ! grep -Ei \
-    'NetBIOS|Domain|Computer|Workgroup|Names' \
-    "$NB_OUT"; then
-    echo "No matching NetBIOS fields were returned."
-fi
+echo "--- NetBIOS results ---"
+grep -Ei \
+    'NetBIOS|Domain|Computer name|137/udp' \
+    "$REPORT_DIR/netbios.txt" || echo "No NetBIOS names found."
 
 echo
-echo "=================================================="
-echo " STEP 7: DNS TREE NAME INTERPRETATION"
-echo "=================================================="
+echo "--- DNS SRV answers ---"
+SRV_COUNT=0
+for F in "$REPORT_DIR"/srv_*.txt; do
+    [[ -f "$F" ]] || continue
+    if [[ -s "$F" ]]; then
+        cat "$F"
+        SRV_COUNT=$((SRV_COUNT + 1))
+    fi
+done
+if [[ "$SRV_COUNT" -eq 0 ]]; then
+    echo "No DNS SRV answers were saved."
+fi
 
-ROOT_CONTEXT="$(
-    grep -Eio 'rootDomainNamingContext[^,|]*([,|].*)?' "$LDAP_OUT" |
-    head -n 1 || true
-)"
+# ---------- Step 8: Interpretation ----------
+banner "STEP 8: DNS TREE NAME INTERPRETATION"
 
-DEFAULT_CONTEXT="$(
-    grep -Eio 'defaultNamingContext[^,|]*([,|].*)?' "$LDAP_OUT" |
-    head -n 1 || true
-)"
+ROOT_CONTEXT=$(grep -i 'rootDomainNamingContext' "$REPORT_DIR/ldap.txt" | head -n 1 || true)
+DEFAULT_CONTEXT=$(grep -i 'defaultNamingContext' "$REPORT_DIR/ldap.txt" | head -n 1 || true)
+DNS_HOST=$(grep -i 'dnsHostName' "$REPORT_DIR/ldap.txt" | head -n 1 || true)
 
-DNS_HOST="$(
-    grep -Eio 'dnsHostName[^,|]*' "$LDAP_OUT" |
-    head -n 1 || true
-)"
-
-echo "Root domain context: ${ROOT_CONTEXT:-Not extracted}"
+echo "Root domain context:   ${ROOT_CONTEXT:-Not extracted}"
 echo "Default domain context: ${DEFAULT_CONTEXT:-Not extracted}"
-echo "DNS host name: ${DNS_HOST:-Not extracted}"
+echo "DNS host name:         ${DNS_HOST:-Not extracted}"
 
 echo
-echo "IMPORTANT:"
-echo "• rootDomainNamingContext identifies the forest root domain context."
-echo "• defaultNamingContext identifies the server's default domain context."
-echo "• DNS tree names can be derived from DC components in a naming context."
-echo "• No result does not prove that the target lacks Active Directory."
-echo "• Access restrictions, closed ports, or disabled services may prevent discovery."
+echo "Interpretation:"
+echo "* DC=skill,DC=ceh,DC=com corresponds to skill.ceh.com."
+echo "* LDAP naming contexts can reveal directory domain information."
+echo "* DNS SRV answers may identify domain controllers and their ports."
+echo "* No results do not prove that Active Directory is absent."
+echo "* Filtered ports, DNS restrictions, and access controls can block discovery."
 
 echo
-echo "Scan complete."
+echo "${GREEN}Scan complete.${RESET}"
+echo "Full reports saved in: $REPORT_DIR"
