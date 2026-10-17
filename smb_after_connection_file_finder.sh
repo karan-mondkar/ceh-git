@@ -3,6 +3,7 @@
 
 # SMB Recursive File Finder and Downloader
 # For authorized CEH labs and systems only.
+# Downloads all accessible files from discovered disk shares.
 
 set -uo pipefail
 umask 077
@@ -13,10 +14,9 @@ read -r -p "Target IP or hostname: " TARGET
 read -r -p "SMB username: " USERNAME
 read -r -s -p "SMB password: " PASSWORD
 printf '\n'
-read -r -p "Filename to search (e.g. abc, abc.txt, .txt): " PATTERN
 
-if [[ -z "$TARGET" || -z "$USERNAME" || -z "$PATTERN" ]]; then
-    echo "[ERROR] Target, username, and filename pattern are required." >&2
+if [[ -z "$TARGET" || -z "$USERNAME" ]]; then
+    echo "[ERROR] Target and username are required." >&2
     unset PASSWORD
     exit 1
 fi
@@ -29,31 +29,14 @@ fi
 
 # -------------------- Dependencies --------------------
 
-for CMD in smbclient find awk wc mktemp date; do
+for CMD in smbclient find awk mktemp date sort; do
     if ! command -v "$CMD" >/dev/null 2>&1; then
         echo "[ERROR] Required command is missing: $CMD" >&2
-        echo "[INFO] On Parrot OS, install SMB client with:" >&2
-        echo "       sudo apt install smbclient" >&2
+        echo "[INFO] Install SMB client with: sudo apt install smbclient" >&2
         unset PASSWORD
         exit 1
     fi
 done
-
-# -------------------- Validate filename pattern --------------------
-
-case "$PATTERN" in
-    *[!a-zA-Z0-9._-]*)
-        echo "[ERROR] Use only letters, numbers, dots, underscores, and hyphens." >&2
-        unset PASSWORD
-        exit 1
-        ;;
-esac
-
-# A leading dot means extension search, e.g. .txt -> *.txt.
-case "$PATTERN" in
-    .*) MASK="*$PATTERN" ;;
-    *)  MASK="*$PATTERN*" ;;
-esac
 
 # -------------------- Temporary credentials --------------------
 
@@ -95,35 +78,30 @@ OUTDIR="$(mktemp -d "$PWD/smb_downloads_$(date +%Y%m%d_%H%M%S)_XXXXXX")" || {
 
 printf '\n'
 echo "============================================"
-echo "       SMB RECURSIVE FILE FINDER"
+echo "     SMB RECURSIVE FILE DOWNLOADER"
 echo "============================================"
-echo "Target:            $TARGET"
-echo "Filename pattern:  $PATTERN"
-echo "SMB filename mask: $MASK"
-echo "Output directory:  $OUTDIR"
+echo "Target:          $TARGET"
+echo "Download mode:   All accessible files"
+echo "Output directory: $OUTDIR"
 echo "============================================"
 
 # -------------------- Discover SMB shares --------------------
 
 echo
-echo "[INFO] Discovering SMB shares on $TARGET ..."
+echo "[INFO] Discovering SMB disk shares on $TARGET ..."
 
-# Standard output is captured for parsing.
-# Standard error remains visible in the terminal.
 SHARE_OUTPUT="$(smbclient -g -L "//$TARGET" -A "$AUTH_FILE")"
 SHARE_STATUS=$?
 
 if (( SHARE_STATUS != 0 )); then
     [[ -z "$SHARE_OUTPUT" ]] || printf '%s\n' "$SHARE_OUTPUT"
     echo "[ERROR] Share enumeration failed (exit code $SHARE_STATUS)." >&2
-    echo "[INFO] Check connectivity, credentials, SMB version, and permissions." >&2
+    echo "[INFO] Check connectivity, credentials, SMB compatibility, and permissions." >&2
     exit 1
 fi
 
 [[ -z "$SHARE_OUTPUT" ]] || printf '%s\n' "$SHARE_OUTPUT"
 
-# smbclient -g formats share entries as:
-# Disk|share_name|comment
 mapfile -t SHARES < <(
     printf '%s\n' "$SHARE_OUTPUT" |
         awk -F'|' '$1 == "Disk" && $2 != "" { print $2 }' |
@@ -131,8 +109,8 @@ mapfile -t SHARES < <(
 )
 
 if ((${#SHARES[@]} == 0)); then
-    echo "[ERROR] No disk shares found in the SMB listing." >&2
-    echo "[INFO] The server may deny share enumeration, or no disk shares may be available." >&2
+    echo "[ERROR] No disk shares found." >&2
+    echo "[INFO] Share enumeration may be restricted by the server." >&2
     exit 1
 fi
 
@@ -140,7 +118,7 @@ echo
 echo "[INFO] Discovered ${#SHARES[@]} disk share(s):"
 printf '  - %s\n' "${SHARES[@]}"
 
-# -------------------- Search and download --------------------
+# -------------------- Download all accessible files --------------------
 
 SHARES_CHECKED=0
 SHARES_FAILED=0
@@ -155,7 +133,7 @@ for SHARE in "${SHARES[@]}"; do
     echo "[SHARE] $SHARE"
     echo "============================================"
 
-    # Produce a local directory name that cannot escape OUTDIR.
+    # Sanitize the share name for local directory use.
     SAFE_SHARE="${SHARE//\//_}"
     SAFE_SHARE="${SAFE_SHARE//\\/_}"
     SAFE_SHARE="${SAFE_SHARE//:/_}"
@@ -172,18 +150,15 @@ for SHARE in "${SHARES[@]}"; do
         continue
     fi
 
-    echo "[INFO] Searching recursively for: $MASK"
+    echo "[INFO] Downloading all accessible files recursively."
     echo "[INFO] Destination: $DEST"
 
-    # Escape characters used by smbclient's command parser.
+    # Escape the local path for smbclient's command parser.
     SMB_DEST="${DEST//\\/\\\\}"
     SMB_DEST="${SMB_DEST//\"/\\\"}"
 
-    # The mask restricts files selected during recursive mget.
-    # Prompting is disabled so matching files download automatically.
-    SMB_COMMAND="lcd \"$SMB_DEST\"; mask $MASK; recurse ON; prompt OFF; mget *"
-
-    echo "[INFO] Starting SMB search/download..."
+    # No mask or filename filter: attempt to retrieve all files.
+    SMB_COMMAND="lcd \"$SMB_DEST\"; recurse ON; prompt OFF; mget *"
 
     smbclient "//$TARGET/$SHARE" \
         -A "$AUTH_FILE" \
@@ -191,8 +166,7 @@ for SHARE in "${SHARES[@]}"; do
 
     SMB_STATUS=$?
 
-    # OUTDIR is unique to this run, so these are files found during
-    # this run rather than files left over from an earlier execution.
+    # Count downloaded regular files in this run's share directory.
     FILE_COUNT="$(find "$DEST" -type f -print | awk 'END { print NR+0 }')"
 
     if [[ "$FILE_COUNT" =~ ^[0-9]+$ ]] && (( FILE_COUNT > 0 )); then
@@ -204,7 +178,7 @@ for SHARE in "${SHARES[@]}"; do
     fi
 
     if (( SMB_STATUS != 0 )); then
-        echo "[ERROR] Share command failed: $SHARE (exit code $SMB_STATUS)" >&2
+        echo "[ERROR] Download command failed for share: $SHARE (exit code $SMB_STATUS)" >&2
         SHARES_FAILED=$((SHARES_FAILED + 1))
     fi
 done
@@ -216,8 +190,6 @@ echo "============================================"
 echo "                  SUMMARY"
 echo "============================================"
 echo "Target:                  $TARGET"
-echo "Filename pattern:        $PATTERN"
-echo "SMB filename mask:       $MASK"
 echo "Shares discovered:       ${#SHARES[@]}"
 echo "Shares checked:          $SHARES_CHECKED"
 echo "Shares with local files: $SHARES_WITH_FILES"
@@ -234,5 +206,5 @@ if (( TOTAL_FILES > 0 )); then
     echo "[DONE] Files were detected in the output directory."
 else
     echo "[INFO] No local files were detected."
-    echo "[INFO] Check the SMB output, filename mask, and permissions."
+    echo "[INFO] Check share permissions and the SMB client output."
 fi
