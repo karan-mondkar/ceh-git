@@ -1,310 +1,160 @@
 
-#!/usr/bin/env bash
-set -Eeuo pipefail
+#!/bin/sh
 
-NETWORK="${1:-}"
+# ==========================================================
+# CEH ACTIVE DIRECTORY / DOMAIN CONTROLLER FINDER
+# POSIX sh compatible - Parrot OS / Kali Linux
+# All output is displayed directly in the terminal.
+# No report files are created.
+# ==========================================================
+# Usage:
+#   sh dc_verify.sh <IP-or-CIDR>
+#
+# Examples:
+#   sh dc_verify.sh 192.168.10.222
+#   sh dc_verify.sh 192.168.10.0/24
+# ==========================================================
 
-if [[ -z "$NETWORK" ]]; then
-    echo "Usage: $0 <network/CIDR>"
-    echo "Example: $0 192.168.10.0/24"
-    exit 1
-fi
+set -u
+LC_ALL=C
+export LC_ALL
 
-for cmd in nmap python3; do
-    if ! command -v "$cmd" >/dev/null 2>&1; then
-        echo "[ERROR] Missing required command: $cmd"
-        echo "Install with: sudo apt install nmap python3"
-        exit 1
-    fi
-done
+PORTS="53,88,135,139,389,445,464,636,3268,3269,3389"
 
-REPORT="dc_finder_$(date +%Y%m%d_%H%M%S)"
-mkdir -p "$REPORT"
-XML="$REPORT/initial_scan.xml"
-
-PORTS="53,88,135,139,389,445,464,636,3268,3269,9389"
-
-echo "=================================================="
-echo " ACTIVE DIRECTORY / DOMAIN CONTROLLER FINDER"
-echo "=================================================="
-echo "Network: $NETWORK"
-echo "Report:  $REPORT"
-echo
-
-if ! nmap -n -Pn -sT --open -T3 --reason \
-    -p "$PORTS" -oX "$XML" "$NETWORK"; then
-    echo "[ERROR] Initial Nmap scan failed."
-    exit 1
-fi
-
-python3 - "$XML" "$REPORT" <<'PY'
-import sys
-import os
-import re
-import subprocess
-import xml.etree.ElementTree as ET
-from collections import Counter
-
-xml_file, report_dir = sys.argv[1:3]
-
-PORT_NAMES = {
-    53: "DNS",
-    88: "Kerberos",
-    135: "MS RPC",
-    139: "NetBIOS",
-    389: "LDAP",
-    445: "SMB",
-    464: "Kerberos password service",
-    636: "LDAPS",
-    3268: "Global Catalog",
-    3269: "Global Catalog TLS",
-    9389: "AD Web Services",
+banner() {
+    echo
+    echo "=================================================="
+    echo "$1"
+    echo "=================================================="
 }
 
-AD_PORTS = {88, 389, 464, 636, 3268, 3269, 9389}
+if [ "$#" -ne 1 ] || [ -z "$1" ]; then
+    echo "Usage: sh dc_verify.sh <IP-or-CIDR>"
+    exit 1
+fi
 
-def get_open_tcp_ports(host):
-    result = set()
-    for port in host.findall("./ports/port"):
-        state = port.find("state")
-        if (port.get("protocol") == "tcp"
-                and state is not None
-                and state.get("state") == "open"):
-            try:
-                result.add(int(port.get("portid")))
-            except (TypeError, ValueError):
-                pass
-    return result
+TARGET="$1"
 
-def get_ipv4(host):
-    for address in host.findall("address"):
-        if address.get("addrtype") == "ipv4":
-            return address.get("addr")
-    return None
+if ! command -v nmap >/dev/null 2>&1; then
+    echo "ERROR: Nmap is not installed."
+    echo "Install with: sudo apt install nmap"
+    exit 1
+fi
 
-def run_rootdse(ip, ports, filename):
-    # Query only ports found open in the initial scan.
-    ldap_ports = [p for p in (389, 636, 3268, 3269) if p in ports]
-    if not ldap_ports:
-        return ""
+banner "CEH ACTIVE DIRECTORY FINDER"
+echo "Target: $TARGET"
+echo "Mode: terminal output only"
+echo "Ports: $PORTS"
 
-    cmd = [
-        "nmap", "-n", "-Pn", "-sT",
-        "-p", ",".join(map(str, ldap_ports)),
-        "--script", "ldap-rootdse",
-        "--script-timeout", "8s",
-        "--host-timeout", "25s",
-        "-oN", "-", ip,
-    ]
+# ----------------------------------------------------------
+# Stage 1: Discover hosts with relevant open ports.
+# ----------------------------------------------------------
 
-    try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=35
-        )
-        output = (result.stdout or "") + "\n" + (result.stderr or "")
-    except subprocess.TimeoutExpired:
-        output = "[LDAP probe timed out]\n"
-    except OSError as exc:
-        output = f"[LDAP probe error: {exc}]\n"
+banner "STAGE 1: HOST DISCOVERY"
 
-    with open(filename, "w", encoding="utf-8") as f:
-        f.write(output)
+DISCOVERY=$(nmap -n -Pn -sT -p "$PORTS" --open -oG - "$TARGET" 2>&1)
+DISCOVERY_STATUS=$?
 
-    return output
+printf '%s\n' "$DISCOVERY"
 
-def extract_field(output, field):
-    # Handles common Nmap ldap-rootdse output formats.
-    pattern = rf"(?im)^\s*\|?\s*{re.escape(field)}\s*:\s*(.*?)\s*$"
-    match = re.search(pattern, output)
-    return match.group(1).strip() if match else ""
+if [ "$DISCOVERY_STATUS" -ne 0 ]; then
+    echo "WARNING: Nmap discovery returned exit code $DISCOVERY_STATUS."
+fi
 
-def context_to_domain(context):
-    if not context:
-        return ""
-    parts = re.findall(r"(?i)(?:^|,)\s*DC\s*=\s*([^,]+)", context)
-    return ".".join(parts)
+case "$TARGET" in
+    */*)
+        HOSTS=$(printf '%s\n' "$DISCOVERY" | awk '/^Host: / && /Ports:/ {print $2}' | sort -u)
+        ;;
+    *)
+        HOSTS="$TARGET"
+        ;;
+esac
 
-def classify(ports, ldap_output, srv_found):
-    default_nc = extract_field(ldap_output, "defaultNamingContext")
-    root_nc = extract_field(ldap_output, "rootDomainNamingContext")
-    dns_host = extract_field(ldap_output, "dnsHostName")
-    ds_service = extract_field(ldap_output, "dsServiceName")
-    naming_contexts = extract_field(ldap_output, "namingContexts")
-    global_catalog_ready = extract_field(ldap_output, "isGlobalCatalogReady")
+if [ -z "$HOSTS" ]; then
+    echo
+    echo "No hosts with selected open ports were found."
+    echo "Check the target subnet and network connectivity."
+    exit 0
+fi
 
-    has_domain_context = bool(default_nc or root_nc)
-    has_server_identity = bool(dns_host or ds_service)
-    has_ldap_evidence = has_domain_context and has_server_identity
-    kerberos = 88 in ports or 464 in ports
-    ldap = bool({389, 636, 3268, 3269} & ports)
-    smb = bool({139, 445} & ports)
-    gc = bool({3268, 3269} & ports)
-    adws = 9389 in ports
+# ----------------------------------------------------------
+# Stage 2: Inspect each host.
+# ----------------------------------------------------------
 
-    evidence = []
+banner "STAGE 2: DOMAIN AND DC VERIFICATION"
 
-    if kerberos:
-        evidence.append("Kerberos port open")
-    if ldap:
-        evidence.append("LDAP/LDAPS/Global Catalog port open")
-    if smb:
-        evidence.append("SMB/NetBIOS port open")
-    if gc:
-        evidence.append("Global Catalog port open")
-    if adws:
-        evidence.append("AD Web Services port open")
-    if default_nc:
-        evidence.append("LDAP defaultNamingContext returned")
-    if root_nc:
-        evidence.append("LDAP rootDomainNamingContext returned")
-    if dns_host:
-        evidence.append("LDAP dnsHostName returned")
-    if ds_service:
-        evidence.append("LDAP dsServiceName returned")
-    if srv_found:
-        evidence.append("AD-related DNS SRV record resolved")
+for IP in $HOSTS
+do
+    echo
+    echo "##################################################"
+    echo "Checking host: $IP"
+    echo "##################################################"
 
-    if has_ldap_evidence:
-        label = "STRONG EVIDENCE: ACTIVE DIRECTORY DOMAIN CONTROLLER"
-        reason = (
-            "LDAP returned domain naming context information and "
-            "a directory-server identity. This strongly supports an "
-            "Active Directory domain controller, but should be "
-            "validated against the lab/domain configuration."
-        )
-    elif (kerberos and ldap and (smb or gc or adws)) or (
-        srv_found and (kerberos or ldap)
-    ):
-        label = "PROBABLE DOMAIN CONTROLLER"
-        reason = (
-            "Multiple services or DNS records are consistent with "
-            "Active Directory, but LDAP identity evidence was incomplete."
-        )
-    elif ldap or kerberos or gc or adws:
-        label = "POSSIBLE DOMAIN CONTROLLER"
-        reason = (
-            "Some Active Directory-related services are open, "
-            "but the available evidence is insufficient to identify a DC."
-        )
-    else:
-        label = "INSUFFICIENT EVIDENCE"
-        reason = (
-            "The discovered ports do not establish that this host "
-            "is a domain controller."
-        )
+    DETAIL=$(nmap -n -Pn -sT -sV -p "$PORTS" --script rdp-ntlm-info,smb-os-discovery,ldap-rootdse -oN - "$IP" 2>&1)
+    DETAIL_STATUS=$?
 
-    return label, reason, evidence, default_nc, root_nc, dns_host
+    # Print the complete Nmap output directly.
+    printf '%s\n' "$DETAIL"
 
-try:
-    root = ET.parse(xml_file).getroot()
-except (OSError, ET.ParseError) as exc:
-    print(f"[ERROR] Could not parse Nmap XML: {exc}")
-    sys.exit(1)
+    if [ "$DETAIL_STATUS" -ne 0 ]; then
+        echo "WARNING: Detailed scan returned code $DETAIL_STATUS."
+    fi
 
-hosts = []
-for host in root.findall("host"):
-    status = host.find("status")
-    if status is None or status.get("state") != "up":
-        continue
+    # Extract AD identity fields.
+    NETBIOS_DOMAIN=$(printf '%s\n' "$DETAIL" | grep -i 'NetBIOS_Domain_Name:' | head -n 1 | sed 's/^[[:space:]]*|[[:space:]]*//')
+    DNS_DOMAIN=$(printf '%s\n' "$DETAIL" | grep -i 'DNS_Domain_Name:' | head -n 1 | sed 's/^[[:space:]]*|[[:space:]]*//')
+    DNS_TREE=$(printf '%s\n' "$DETAIL" | grep -i 'DNS_Tree_Name:' | head -n 1 | sed 's/^[[:space:]]*|[[:space:]]*//')
+    COMPUTER=$(printf '%s\n' "$DETAIL" | grep -i 'NetBIOS_Computer_Name:' | head -n 1 | sed 's/^[[:space:]]*|[[:space:]]*//')
+    ROOT_CONTEXT=$(printf '%s\n' "$DETAIL" | grep -i 'rootDomainNamingContext:' | head -n 1)
+    DEFAULT_CONTEXT=$(printf '%s\n' "$DETAIL" | grep -i 'defaultNamingContext:' | head -n 1)
 
-    ip = get_ipv4(host)
-    ports = get_open_tcp_ports(host)
+    # Detect DC-related open services.
+    KERBEROS=$(printf '%s\n' "$DETAIL" | grep -E '(^|[[:space:]])88/tcp[[:space:]]+open([[:space:]]|$)' || true)
+    LDAP=$(printf '%s\n' "$DETAIL" | grep -E '(^|[[:space:]])389/tcp[[:space:]]+open([[:space:]]|$)' || true)
+    GC=$(printf '%s\n' "$DETAIL" | grep -E '(^|[[:space:]])(3268|3269)/tcp[[:space:]]+open([[:space:]]|$)' || true)
 
-    if ip and ports:
-        hosts.append((ip, ports))
+    echo
+    echo "--------------- IDENTITY SUMMARY ---------------"
+    echo "Host IP: $IP"
+    echo "NetBIOS domain: ${NETBIOS_DOMAIN:-Not disclosed}"
+    echo "DNS domain:     ${DNS_DOMAIN:-Not disclosed}"
+    echo "DNS tree:       ${DNS_TREE:-Not disclosed}"
+    echo "Computer name:  ${COMPUTER:-Not disclosed}"
+    echo "------------------------------------------------"
 
-def ip_key(item):
-    return tuple(int(x) for x in item[0].split("."))
+    # Classify using the actual evidence, not just port 53.
+    echo
+    echo "--------------- FINAL ASSESSMENT ---------------"
 
-hosts.sort(key=ip_key)
+    if [ -n "$ROOT_CONTEXT" ] && [ -n "$DEFAULT_CONTEXT" ]; then
+        echo "RESULT: STRONG DOMAIN CONTROLLER EVIDENCE"
+        echo "Reason: LDAP returned both RootDSE naming contexts."
+        echo "Candidate IP: $IP"
+    elif [ -n "$KERBEROS" ] && [ -n "$LDAP" ] && [ -n "$NETBIOS_DOMAIN" ]; then
+        echo "RESULT: PROBABLE DOMAIN CONTROLLER"
+        echo "Reason: Kerberos, LDAP and domain identity are present."
+        echo "Candidate IP: $IP"
+    elif [ -n "$GC" ]; then
+        echo "RESULT: PROBABLE DOMAIN CONTROLLER"
+        echo "Reason: A Global Catalog service is open."
+        echo "Candidate IP: $IP"
+    elif [ -n "$DNS_TREE" ] && [ -n "$NETBIOS_DOMAIN" ]; then
+        echo "RESULT: ACTIVE DIRECTORY DOMAIN IDENTITY FOUND"
+        echo "Candidate IP: $IP"
+        echo "The RDP NTLM response disclosed the DNS tree and NetBIOS domain."
+        echo "DC ROLE: Not independently confirmed by the available port evidence."
+    elif [ -n "$NETBIOS_DOMAIN" ] && [ -n "$DNS_DOMAIN" ]; then
+        echo "RESULT: DOMAIN IDENTITY FOUND"
+        echo "Candidate IP: $IP"
+        echo "DC ROLE: Not independently confirmed."
+    else
+        echo "RESULT: NOT CONFIRMED"
+        echo "Insufficient domain-controller evidence was returned."
+    fi
 
-if not hosts:
-    print("\nNo hosts with the requested open TCP ports were found.")
-    print("This does not prove that no domain controller exists.")
-    print(f"Initial scan XML: {xml_file}")
-    sys.exit(0)
+    echo "------------------------------------------------"
+done
 
-counts = Counter()
-
-print("\n========== DOMAIN CONTROLLER ASSESSMENT ==========")
-
-for index, (ip, ports) in enumerate(hosts, start=1):
-    print(f"\n[{index}/{len(hosts)}] Host: {ip}")
-    print("Open TCP ports:", ", ".join(map(str, sorted(ports))))
-
-    for port in sorted(ports):
-        print(f"  {port}/tcp - {PORT_NAMES.get(port, 'Unknown service')}")
-
-    ldap_output = ""
-    if ports & {389, 636, 3268, 3269}:
-        ldap_file = os.path.join(report_dir, f"ldap_{ip}.txt")
-        print("Checking LDAP RootDSE...")
-        ldap_output = run_rootdse(ip, ports, ldap_file)
-
-    # Try DNS SRV discovery when a domain can be derived from LDAP.
-    default_nc = extract_field(ldap_output, "defaultNamingContext")
-    root_nc = extract_field(ldap_output, "rootDomainNamingContext")
-    domain = context_to_domain(default_nc or root_nc)
-    srv_found = False
-
-    shutil_which = __import__("shutil").which("dig")
-
-    if domain and shutil_which:
-        srv_name = f"_ldap._tcp.dc._msdcs.{domain}"
-        try:
-            srv = subprocess.run(
-                [shutil_which, "+time=2", "+tries=1", "+short",
-                 "SRV", srv_name],
-                capture_output=True, text=True, timeout=6
-            )
-            srv_file = os.path.join(report_dir, f"srv_{ip}.txt")
-            with open(srv_file, "w", encoding="utf-8") as f:
-                f.write(srv.stdout or "")
-                if srv.stderr:
-                    f.write(srv.stderr)
-
-            records = [
-                line.strip() for line in (srv.stdout or "").splitlines()
-                if line.strip()
-            ]
-            srv_found = bool(records)
-            if records:
-                print(f"AD DNS SRV records for {domain}:")
-                for record in records:
-                    print(" ", record)
-        except (subprocess.TimeoutExpired, OSError):
-            pass
-
-    label, reason, evidence, default_nc, root_nc, dns_host = classify(
-        ports, ldap_output, srv_found
-    )
-    counts[label] += 1
-
-    print("Evidence:", "; ".join(evidence) if evidence else "None")
-    print("LDAP default naming context:", default_nc or "Not returned")
-    print("LDAP root naming context:   ", root_nc or "Not returned")
-    print("LDAP DNS host name:          ", dns_host or "Not returned")
-    print("ASSESSMENT:", label)
-    print("Reason:", reason)
-
-print("\n========== SUMMARY ==========")
-print("Hosts assessed:", len(hosts))
-for label in (
-    "STRONG EVIDENCE: ACTIVE DIRECTORY DOMAIN CONTROLLER",
-    "PROBABLE DOMAIN CONTROLLER",
-    "POSSIBLE DOMAIN CONTROLLER",
-    "INSUFFICIENT EVIDENCE",
-):
-    print(f"{label}: {counts[label]}")
-
-print("\nLimitations:")
-print("* Filtered ports can hide a real domain controller.")
-print("* LDAP responses may be restricted or unavailable.")
-print("* DNS SRV checks use the resolver configured on this machine.")
-print("* Strong evidence is not a substitute for authorized domain validation.")
-print(f"\nReports saved to: {report_dir}")
-PY
-
-echo
-echo "Scan complete."
-echo "Review the XML and per-host LDAP reports in: $REPORT"
+banner "SCAN COMPLETE"
+echo "All results were displayed in the terminal."
+echo "No output report files were created."

