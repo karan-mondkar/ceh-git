@@ -1,8 +1,8 @@
 from pathlib import Path
 script = r'''#!/usr/bin/env bash
-# android_apk_crc.sh
-# Enumerate installed packages, query their APK paths, pull accessible APKs,
-# calculate CRC-32, print a readable report, and save it as plain text.
+# android_apk_crc_value_finder.sh
+# Lists installed packages, pulls APK paths exposed by Android package manager,
+# calculates each pulled APK's CRC-32, prints results live, and saves a text report.
 # Use only on devices you own or are authorized to examine.
 
 set -uo pipefail
@@ -17,21 +17,22 @@ log()  { printf '[INFO] %s\n' "$*"; }
 warn() { printf '[WARN] %s\n' "$*" >&2; }
 die()  { printf '[ERROR] %s\n' "$*" >&2; exit 1; }
 
-if [[ -z "$PHONE_IP" || "$#" -ne 1 ]]; then
+if [[ "$#" -ne 1 || -z "$PHONE_IP" ]]; then
     printf 'Usage: %s PHONE_IP\nExample: %s 192.168.10.121\n' "$0" "$0"
     exit 1
 fi
 
-# Reject spaces and malformed IPv4 addresses.
+# Validate IPv4 and catch accidental spaces copied into the address.
 if [[ "$PHONE_IP" == *[[:space:]]* ]] || ! python3 - "$PHONE_IP" <<'PY' >/dev/null 2>&1
 import ipaddress, sys
 ipaddress.IPv4Address(sys.argv[1])
 PY
 then
-    die "Invalid IPv4 address. Use e.g. 192.168.10.121 with no spaces."
+    die "Invalid IPv4 address. Enter it without spaces, e.g. 192.168.10.121"
 fi
 
-command -v python3 >/dev/null 2>&1 || die "python3 is required for CRC-32."
+command -v python3 >/dev/null 2>&1 || die "python3 is required for CRC-32 calculation."
+
 if ! command -v adb >/dev/null 2>&1; then
     log "ADB is missing. Attempting installation..."
     command -v apt-get >/dev/null 2>&1 || die "Install Android platform-tools (adb) and rerun."
@@ -49,7 +50,7 @@ DEST="$HOME/android_apk_crc_${PHONE_IP}"
 APK_DIR="$DEST/apks"
 REPORT="$DEST/apk_crc_report.txt"
 PKG_FILE="$DEST/packages.txt"
-mkdir -p "$APK_DIR" || die "Cannot create $APK_DIR"
+mkdir -p "$APK_DIR" || die "Cannot create destination directory: $APK_DIR"
 : > "$REPORT"
 
 report() { printf '%s\n' "$*" | tee -a "$REPORT"; }
@@ -60,8 +61,11 @@ for ((i=1; i<=RETRIES; i++)); do
     log "Connecting to $DEVICE ($i/$RETRIES)..."
     adb connect "$DEVICE" 2>&1 || true
     state="$(adb -s "$DEVICE" get-state 2>/dev/null || true)"
-    if [[ "$state" == "device" ]]; then connected=true; break; fi
-    warn "ADB state: ${state:-unavailable}; check Wi-Fi debugging and authorization."
+    if [[ "$state" == "device" ]]; then
+        connected=true
+        break
+    fi
+    warn "ADB state: ${state:-unavailable}. Check wireless debugging and authorization."
     sleep "$DELAY"
 done
 [[ "$connected" == true ]] || die "Could not connect to $DEVICE."
@@ -71,7 +75,7 @@ if ! adb -s "$DEVICE" shell pm list packages > "$DEST/packages_raw.txt" 2>"$DEST
 fi
 tr -d '\r' < "$DEST/packages_raw.txt" | sed -n 's/^package://p' > "$PKG_FILE"
 package_count="$(grep -c . "$PKG_FILE" 2>/dev/null || true)"
-[[ "$package_count" -gt 0 ]] || die "No package names returned by Android."
+[[ "$package_count" -gt 0 ]] || die "Android returned no package names."
 
 report "============================================================"
 report "ANDROID APK CRC-32 REPORT"
@@ -91,7 +95,7 @@ while IFS= read -r pkg || [[ -n "$pkg" ]]; do
     pkg_num=$((pkg_num + 1))
     printf '[PACKAGE %s/%s] %s\n' "$pkg_num" "$package_count" "$pkg"
 
-    # Reconnect if ADB closed between package requests.
+    # Recover from a dropped ADB connection.
     state="$(adb -s "$DEVICE" get-state 2>/dev/null || true)"
     if [[ "$state" != "device" ]]; then
         log "Connection dropped; reconnecting..."
@@ -103,27 +107,24 @@ while IFS= read -r pkg || [[ -n "$pkg" ]]; do
             sleep "$DELAY"
         done
         if [[ "$reconnected" != true ]]; then
-            warn "Still disconnected; cannot query $pkg"
+            warn "Unable to reconnect; skipping $pkg"
             path_fail=$((path_fail + 1))
             continue
         fi
     fi
 
-    path_file="$DEST/.path_${BASHPID}.tmp"
+    path_file="$DEST/.paths.tmp"
     if ! adb -s "$DEVICE" shell pm path "$pkg" > "$path_file" 2>"$DEST/.pm_path_error.tmp"; then
         warn "pm path command failed for $pkg"
         path_fail=$((path_fail + 1))
-        rm -f "$path_file"
         continue
     fi
-
     tr -d '\r' < "$path_file" > "$path_file.clean"
     mv "$path_file.clean" "$path_file"
-    mapfile -t remote_paths < <(sed -n 's/^package://p' "$path_file")
-    rm -f "$path_file"
 
+    mapfile -t remote_paths < <(sed -n 's/^package://p' "$path_file")
     if ((${#remote_paths[@]} == 0)); then
-        warn "No package: path returned for $pkg"
+        warn "No APK path returned for $pkg"
         path_fail=$((path_fail + 1))
         continue
     fi
@@ -136,8 +137,9 @@ while IFS= read -r pkg || [[ -n "$pkg" ]]; do
         printf '  APK path: %s\n' "$remote"
 
         if [[ ! -s "$local_file" ]]; then
+            log "Pulling $pkg ($base)..."
             if ! adb -s "$DEVICE" pull "$remote" "$local_file"; then
-                warn "Pull failed for $pkg ($remote)"
+                warn "Pull failed: $pkg ($remote)"
                 rm -f "$local_file"
                 report "Package: $pkg | APK: $remote | Status: PULL_FAILED"
                 pull_fail=$((pull_fail + 1))
@@ -147,17 +149,18 @@ while IFS= read -r pkg || [[ -n "$pkg" ]]; do
 
         crc="$(python3 - "$local_file" <<'PY'
 import sys, zlib
-crc = 0
-with open(sys.argv[1], "rb") as f:
-    for block in iter(lambda: f.read(1024 * 1024), b""):
-        crc = zlib.crc32(block, crc)
-print(f"{crc & 0xffffffff:08X}")
+value = 0
+with open(sys.argv[1], "rb") as stream:
+    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+        value = zlib.crc32(chunk, value)
+print(f"{value & 0xffffffff:08X}")
 PY
-)" || {
+)"
+        if [[ $? -ne 0 || -z "$crc" ]]; then
             warn "CRC calculation failed for $local_file"
             pull_fail=$((pull_fail + 1))
             continue
-        }
+        fi
 
         size="$(wc -c < "$local_file" | tr -d ' ')"
         report "Package : $pkg"
@@ -169,6 +172,7 @@ PY
         report "------------------------------------------------------------"
         copied=$((copied + 1))
     done
+    rm -f "$path_file"
 done < "$PKG_FILE"
 
 report ""
@@ -185,10 +189,10 @@ report "============================================================"
 log "Finished. Report displayed above and saved to $REPORT"
 adb disconnect "$DEVICE" >/dev/null 2>&1 || true
 '''
-p=Path("/mnt/data/android_apk_crc.sh")
+p=Path("/mnt/data/android_apk_crc_value_finder.sh")
 p.write_text(script, encoding="utf-8")
 p.chmod(0o755)
 import subprocess
 r=subprocess.run(["bash","-n",str(p)],capture_output=True,text=True)
-print("Created:", p)
-print("bash -n:", "PASS" if r.returncode==0 else r.stderr)
+print("Created:",p)
+print("bash -n:", "PASS" if r.returncode == 0 else r.stderr)
