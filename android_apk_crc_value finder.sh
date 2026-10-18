@@ -1,5 +1,4 @@
-from pathlib import Path
-script = r'''#!/usr/bin/env bash
+#!/usr/bin/env bash
 # android_apk_crc_value_finder.sh
 # Lists installed packages, pulls APK paths exposed by Android package manager,
 # calculates each pulled APK's CRC-32, prints results live, and saves a text report.
@@ -188,11 +187,3 @@ report "============================================================"
 
 log "Finished. Report displayed above and saved to $REPORT"
 adb disconnect "$DEVICE" >/dev/null 2>&1 || true
-'''
-p=Path("/mnt/data/android_apk_crc_value_finder.sh")
-p.write_text(script, encoding="utf-8")
-p.chmod(0o755)
-import subprocess
-r=subprocess.run(["bash","-n",str(p)],capture_output=True,text=True)
-print("Created:",p)
-print("bash -n:", "PASS" if r.returncode == 0 else r.stderr)
