@@ -1,18 +1,17 @@
 from pathlib import Path
-
 script = r'''#!/usr/bin/env bash
 # android_apk_crc.sh
-# List installed packages, pull APK files accessible through ADB, calculate
-# each APK's CRC-32, print results live, and save a readable text report.
+# Enumerate installed packages, query their APK paths, pull accessible APKs,
+# calculate CRC-32, print a readable report, and save it as plain text.
 # Use only on devices you own or are authorized to examine.
 
-set -Eeuo pipefail
+set -uo pipefail
 umask 077
 
 PHONE_IP="${1:-}"
-ADB_PORT=5555
-MAX_RETRIES=5
-RETRY_DELAY=3
+PORT=5555
+RETRIES=5
+DELAY=3
 
 log()  { printf '[INFO] %s\n' "$*"; }
 warn() { printf '[WARN] %s\n' "$*" >&2; }
@@ -23,8 +22,16 @@ if [[ -z "$PHONE_IP" || "$#" -ne 1 ]]; then
     exit 1
 fi
 
-command -v python3 >/dev/null 2>&1 || die "python3 is required for CRC-32 calculation."
+# Reject spaces and malformed IPv4 addresses.
+if [[ "$PHONE_IP" == *[[:space:]]* ]] || ! python3 - "$PHONE_IP" <<'PY' >/dev/null 2>&1
+import ipaddress, sys
+ipaddress.IPv4Address(sys.argv[1])
+PY
+then
+    die "Invalid IPv4 address. Use e.g. 192.168.10.121 with no spaces."
+fi
 
+command -v python3 >/dev/null 2>&1 || die "python3 is required for CRC-32."
 if ! command -v adb >/dev/null 2>&1; then
     log "ADB is missing. Attempting installation..."
     command -v apt-get >/dev/null 2>&1 || die "Install Android platform-tools (adb) and rerun."
@@ -37,134 +44,151 @@ if ! command -v adb >/dev/null 2>&1; then
     fi
 fi
 
-DEVICE="${PHONE_IP}:${ADB_PORT}"
-SAFE_IP="${PHONE_IP//[^a-zA-Z0-9_.-]/_}"
-DEST="$HOME/android_apk_crc_${SAFE_IP}"
+DEVICE="${PHONE_IP}:${PORT}"
+DEST="$HOME/android_apk_crc_${PHONE_IP}"
 APK_DIR="$DEST/apks"
 REPORT="$DEST/apk_crc_report.txt"
-mkdir -p "$APK_DIR"
+PKG_FILE="$DEST/packages.txt"
+mkdir -p "$APK_DIR" || die "Cannot create $APK_DIR"
 : > "$REPORT"
 
-# Print to the screen and save the same report lines in a plain text file.
-report() {
-    printf '%s\n' "$*" | tee -a "$REPORT"
-}
+report() { printf '%s\n' "$*" | tee -a "$REPORT"; }
 
 adb start-server >/dev/null 2>&1 || true
 connected=false
-for ((attempt=1; attempt<=MAX_RETRIES; attempt++)); do
-    log "Connecting to $DEVICE ($attempt/$MAX_RETRIES)..."
+for ((i=1; i<=RETRIES; i++)); do
+    log "Connecting to $DEVICE ($i/$RETRIES)..."
     adb connect "$DEVICE" 2>&1 || true
     state="$(adb -s "$DEVICE" get-state 2>/dev/null || true)"
-    if [[ "$state" == "device" ]]; then
-        connected=true
-        break
-    fi
-    warn "ADB state: ${state:-unavailable}. Unlock the device and approve debugging if prompted."
-    sleep "$RETRY_DELAY"
+    if [[ "$state" == "device" ]]; then connected=true; break; fi
+    warn "ADB state: ${state:-unavailable}; check Wi-Fi debugging and authorization."
+    sleep "$DELAY"
 done
-[[ "$connected" == true ]] || die "Could not connect. Check the IP, port 5555, wireless debugging, and authorization."
+[[ "$connected" == true ]] || die "Could not connect to $DEVICE."
+
+if ! adb -s "$DEVICE" shell pm list packages > "$DEST/packages_raw.txt" 2>"$DEST/packages_error.txt"; then
+    die "Could not list installed packages; see $DEST/packages_error.txt"
+fi
+tr -d '\r' < "$DEST/packages_raw.txt" | sed -n 's/^package://p' > "$PKG_FILE"
+package_count="$(grep -c . "$PKG_FILE" 2>/dev/null || true)"
+[[ "$package_count" -gt 0 ]] || die "No package names returned by Android."
 
 report "============================================================"
 report "ANDROID APK CRC-32 REPORT"
 report "Device: $DEVICE"
+report "Installed packages: $package_count"
 report "============================================================"
 report ""
 
-PKG_FILE="$DEST/packages.txt"
-if ! adb -s "$DEVICE" shell pm list packages > "$PKG_FILE.tmp"; then
-    die "Could not list installed packages."
-fi
-tr -d '\r' < "$PKG_FILE.tmp" | sed -n 's/^package://p' > "$PKG_FILE"
-rm -f "$PKG_FILE.tmp"
-package_count="$(grep -c . "$PKG_FILE" || true)"
-(( package_count > 0 )) || die "No installed packages were returned."
-
-report "Installed packages found: $package_count"
-report ""
-report "APK CRC-32 results:"
-report "------------------------------------------------------------"
-
-total=0
+paths_found=0
 copied=0
-failed=0
-pkg_index=0
+path_fail=0
+pull_fail=0
+pkg_num=0
 
 while IFS= read -r pkg || [[ -n "$pkg" ]]; do
     [[ -n "$pkg" ]] || continue
-    pkg_index=$((pkg_index + 1))
-    paths_file="$DEST/.paths.tmp"
+    pkg_num=$((pkg_num + 1))
+    printf '[PACKAGE %s/%s] %s\n' "$pkg_num" "$package_count" "$pkg"
 
-    if ! adb -s "$DEVICE" shell pm path "$pkg" > "$paths_file" 2>/dev/null; then
-        warn "Could not get APK path for $pkg"
-        report "[FAILED] Package: $pkg | Reason: could not retrieve APK path"
-        failed=$((failed + 1))
+    # Reconnect if ADB closed between package requests.
+    state="$(adb -s "$DEVICE" get-state 2>/dev/null || true)"
+    if [[ "$state" != "device" ]]; then
+        log "Connection dropped; reconnecting..."
+        reconnected=false
+        for ((i=1; i<=RETRIES; i++)); do
+            adb connect "$DEVICE" >/dev/null 2>&1 || true
+            state="$(adb -s "$DEVICE" get-state 2>/dev/null || true)"
+            if [[ "$state" == "device" ]]; then reconnected=true; break; fi
+            sleep "$DELAY"
+        done
+        if [[ "$reconnected" != true ]]; then
+            warn "Still disconnected; cannot query $pkg"
+            path_fail=$((path_fail + 1))
+            continue
+        fi
+    fi
+
+    path_file="$DEST/.path_${BASHPID}.tmp"
+    if ! adb -s "$DEVICE" shell pm path "$pkg" > "$path_file" 2>"$DEST/.pm_path_error.tmp"; then
+        warn "pm path command failed for $pkg"
+        path_fail=$((path_fail + 1))
+        rm -f "$path_file"
         continue
     fi
-    tr -d '\r' < "$paths_file" > "$paths_file.clean"
-    mv "$paths_file.clean" "$paths_file"
 
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        [[ "$line" == package:* ]] || continue
-        remote="${line#package:}"
+    tr -d '\r' < "$path_file" > "$path_file.clean"
+    mv "$path_file.clean" "$path_file"
+    mapfile -t remote_paths < <(sed -n 's/^package://p' "$path_file")
+    rm -f "$path_file"
+
+    if ((${#remote_paths[@]} == 0)); then
+        warn "No package: path returned for $pkg"
+        path_fail=$((path_fail + 1))
+        continue
+    fi
+
+    for remote in "${remote_paths[@]}"; do
+        [[ -n "$remote" ]] || continue
+        paths_found=$((paths_found + 1))
         base="$(basename "$remote")"
         local_file="$APK_DIR/${pkg}_${base}"
-        total=$((total + 1))
-
-        report "Package : $pkg"
-        report "APK path: $remote"
+        printf '  APK path: %s\n' "$remote"
 
         if [[ ! -s "$local_file" ]]; then
-            log "Pulling $pkg ($base)..."
             if ! adb -s "$DEVICE" pull "$remote" "$local_file"; then
-                warn "Pull failed: $pkg ($remote)"
+                warn "Pull failed for $pkg ($remote)"
                 rm -f "$local_file"
-                report "Local   : NOT COPIED"
-                report "CRC-32  : unavailable"
-                report "Status  : FAILED"
-                report "------------------------------------------------------------"
-                failed=$((failed + 1))
+                report "Package: $pkg | APK: $remote | Status: PULL_FAILED"
+                pull_fail=$((pull_fail + 1))
                 continue
             fi
-        else
-            log "Already pulled: $pkg ($base); recalculating CRC-32."
         fi
 
-        crc="$(python3 -c 'import sys,zlib
-c=0
+        crc="$(python3 - "$local_file" <<'PY'
+import sys, zlib
+crc = 0
 with open(sys.argv[1], "rb") as f:
-    for block in iter(lambda: f.read(1024*1024), b""):
-        c=zlib.crc32(block,c)
-print(f"{c & 0xffffffff:08X}")' "$local_file")"
+    for block in iter(lambda: f.read(1024 * 1024), b""):
+        crc = zlib.crc32(block, crc)
+print(f"{crc & 0xffffffff:08X}")
+PY
+)" || {
+            warn "CRC calculation failed for $local_file"
+            pull_fail=$((pull_fail + 1))
+            continue
+        }
 
+        size="$(wc -c < "$local_file" | tr -d ' ')"
+        report "Package : $pkg"
+        report "APK path: $remote"
         report "Local   : $local_file"
-        report "Size    : $(wc -c < "$local_file" | tr -d ' ') bytes"
+        report "Size    : $size bytes"
         report "CRC-32  : $crc"
         report "Status  : OK"
         report "------------------------------------------------------------"
-        printf '[CRC-32] %s | %s\n' "$pkg" "$crc"
         copied=$((copied + 1))
-    done < "$paths_file"
-    rm -f "$paths_file"
+    done
 done < "$PKG_FILE"
 
 report ""
-report "======================= SUMMARY ============================"
-report "Installed packages : $package_count"
-report "APK paths found    : $total"
-report "APKs copied/hashed : $copied"
-report "Failed APK paths   : $failed"
-report "APK directory      : $APK_DIR"
-report "Text report        : $REPORT"
+report "========================= SUMMARY ========================="
+report "Installed packages        : $package_count"
+report "APK paths returned        : $paths_found"
+report "APKs copied and hashed    : $copied"
+report "Package path failures     : $path_fail"
+report "APK pull/CRC failures     : $pull_fail"
+report "APK directory             : $APK_DIR"
+report "Readable report            : $REPORT"
 report "============================================================"
 
+log "Finished. Report displayed above and saved to $REPORT"
 adb disconnect "$DEVICE" >/dev/null 2>&1 || true
-log "Finished. Results were displayed above and saved to $REPORT"
 '''
-path = Path("/mnt/data/android_apk_crc.sh")
-path.write_text(script, encoding="utf-8")
-path.chmod(0o755)
+p=Path("/mnt/data/android_apk_crc.sh")
+p.write_text(script, encoding="utf-8")
+p.chmod(0o755)
 import subprocess
-check = subprocess.run(["bash", "-n", str(path)], capture_output=True, text=True)
-print("Created:", path)
-print("bash -n:", "PASS" if check.returncode == 0 else check.stderr)
+r=subprocess.run(["bash","-n",str(p)],capture_output=True,text=True)
+print("Created:", p)
+print("bash -n:", "PASS" if r.returncode==0 else r.stderr)
