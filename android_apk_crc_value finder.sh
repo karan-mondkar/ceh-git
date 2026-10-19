@@ -111,9 +111,19 @@ def main():
     phone_sploit_ready = False
     try:
         child = pexpect.spawn(sys.executable, [str(ps_script)], cwd=str(ps_dir),
-                              encoding="utf-8", timeout=35)
+                              encoding="utf-8", timeout=60)
         child.delaybeforesend = 0.15
-        child.expect(r"Enter selection\s*>\s*")
+
+        # Some PhoneSploit-Pro installs pause at startup when optional helper
+        # programs are missing. Accept its "Y / N >" continuation prompt when
+        # present; otherwise continue directly to the main menu.
+        startup_prompt = r"(?is)Do you still want to continue.*?Y\s*/\s*N\s*>"
+        main_menu_prompt = r"(?i)Enter selection\s*>\s*"
+        startup_choice = child.expect([startup_prompt, main_menu_prompt], timeout=60)
+        if startup_choice == 0:
+            child.sendline("Y")
+            child.expect(main_menu_prompt, timeout=60)
+
         child.sendline("1")
         child.expect(r"Enter target phone's IP Address", timeout=20)
         child.expect(r">\s*", timeout=10)
@@ -126,7 +136,13 @@ def main():
         phone_sploit_ready = True
         print("[INFO] PhoneSploit is connected and positioned on the page containing option 36.")
     except Exception as exc:
-        log_error(f"Could not automate PhoneSploit menu: {exc}")
+        detail = ""
+        if child is not None:
+            try:
+                detail = (child.before or "")[-500:].replace("\r", " ").replace("\n", " ")
+            except Exception:
+                pass
+        log_error(f"Could not automate PhoneSploit menu: {exc}. Last screen text: {detail}")
         if child is not None:
             try:
                 child.close(force=True)
