@@ -1,357 +1,275 @@
-#!/usr/bin/env bash
-# android_apk_crc_finder.sh
-#
-# Enumerate installed Android packages over ADB, retrieve every APK path
-# exposed by package manager (including split APKs), and calculate CRC-32
-# over each complete APK file.
-#
-# Usage:
-#   ./android_apk_crc_finder.sh PHONE_IP
-# Example:
-#   ./android_apk_crc_finder.sh 192.168.10.121
-#
-# Use only with devices you own or are explicitly authorized to examine.
+#!/usr/bin/env python3
+"""
+PhoneSploit Option-36 Batch APK CRC32
+Automates PhoneSploit-Pro's menu option 36 for packages with one APK path.
+PhoneSploit-Pro's built-in extract_apk() handles only one path reliably; for
+split-APK packages, this script uses the same ADB pull workflow per APK path
+as a fallback so the whole batch can continue.
 
-set -uo pipefail
-umask 077
+Usage:
+  python3 phonesploit_crc_batch.py /path/to/PhoneSploit-Pro 192.168.10.121
+Optional port is currently PhoneSploit-Pro's default 5555.
+Use only with devices you own or are authorized to test.
+"""
+import argparse
+import ipaddress
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import time
+import zlib
 
-PORT=5555
-MAX_RETRIES=5
-RETRY_DELAY=3
+def run(cmd, timeout=30):
+    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          text=True, timeout=timeout, check=False)
 
-if [[ $# -ne 1 || -z "${1:-}" ]]; then
-    printf 'Usage: %s PHONE_IP\nExample: %s 192.168.10.121\n' "$0" "$0" >&2
-    exit 1
-fi
+def crc32_file(path):
+    crc = 0
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            crc = zlib.crc32(chunk, crc)
+    return f"{crc & 0xffffffff:08X}"
 
-PHONE_IP="$1"
+def safe_name(s):
+    return re.sub(r"[^A-Za-z0-9._-]", "_", s)
 
-if [[ "$PHONE_IP" == *[[:space:]]* ]] || ! python3 - "$PHONE_IP" <<'PY' >/dev/null 2>&1
-import ipaddress, sys
-ipaddress.IPv4Address(sys.argv[1])
-PY
-then
-    printf '[ERROR] Invalid IPv4 address. Use no spaces, e.g. 192.168.10.121\n' >&2
-    exit 1
-fi
+def main():
+    parser = argparse.ArgumentParser(description="Automate PhoneSploit option 36 and calculate APK CRC-32 for all installed packages.")
+    parser.add_argument("phonesploit_dir", help="Directory containing phonesploitpro.py or phonesploit.py")
+    parser.add_argument("phone_ip", help="Authorized Android device IP")
+    parser.add_argument("--port", type=int, default=5555, help="ADB port (default: 5555)")
+    args = parser.parse_args()
 
-command -v python3 >/dev/null 2>&1 || {
-    printf '[ERROR] python3 is required for CRC-32 calculation.\n' >&2
-    exit 1
-}
+    try:
+        ipaddress.ip_address(args.phone_ip)
+        if not 1 <= args.port <= 65535:
+            raise ValueError()
+    except ValueError:
+        print("[ERROR] Invalid IP address or port.", file=sys.stderr)
+        return 2
 
-# Install ADB only if it is missing. Failure here is fatal because no device
-# operations can be performed without ADB.
-if ! command -v adb >/dev/null 2>&1; then
-    printf '[INFO] ADB was not found; attempting installation...\n'
-    if ! command -v apt-get >/dev/null 2>&1; then
-        printf '[ERROR] Install Android platform-tools (adb), then rerun.\n' >&2
-        exit 1
-    fi
-    if [[ "$(id -u)" -eq 0 ]]; then
-        apt-get update && apt-get install -y adb || {
-            printf '[ERROR] ADB installation failed.\n' >&2
-            exit 1
-        }
-    elif command -v sudo >/dev/null 2>&1; then
-        sudo apt-get update && sudo apt-get install -y adb || {
-            printf '[ERROR] ADB installation failed.\n' >&2
-            exit 1
-        }
-    else
-        printf '[ERROR] Cannot install ADB without administrator privileges.\n' >&2
-        exit 1
-    fi
-fi
+    ps_dir = Path(args.phonesploit_dir).expanduser().resolve()
+    ps_script = next((ps_dir / n for n in ("phonesploitpro.py", "phonesploit.py") if (ps_dir / n).is_file()), None)
+    if ps_script is None:
+        print("[ERROR] Could not find phonesploitpro.py or phonesploit.py in:", ps_dir, file=sys.stderr)
+        return 2
+    if shutil.which("adb") is None:
+        print("[ERROR] adb is not installed or not on PATH.", file=sys.stderr)
+        return 2
+    try:
+        import pexpect
+    except ImportError:
+        print("[ERROR] Python module pexpect is required. On Parrot/Kali install it with:", file=sys.stderr)
+        print("        sudo apt install python3-pexpect", file=sys.stderr)
+        return 2
 
-DEVICE="${PHONE_IP}:${PORT}"
-DEST="$HOME/android_apk_crc_${PHONE_IP}"
-APK_DIR="$DEST/apks"
-REPORT="$DEST/apk_crc_report.txt"
-PACKAGES="$DEST/packages.txt"
-ERROR_LOG="$DEST/errors.log"
+    device = f"{args.phone_ip}:{args.port}"
+    out_dir = Path.home() / f"phonesploit_crc_{safe_name(args.phone_ip)}_{args.port}"
+    apk_dir = out_dir / "apks"
+    apk_dir.mkdir(parents=True, exist_ok=True)
+    report_path = out_dir / "crc32_report.txt"
+    error_path = out_dir / "errors.log"
+    pull_log = out_dir / "adb_pull.log"
+    errors = []
+    rows = []
+    counts = {"ok": 0, "failed": 0, "split_paths": 0}
 
-if ! mkdir -p "$APK_DIR"; then
-    printf '[ERROR] Cannot create output directory: %s\n' "$APK_DIR" >&2
-    exit 1
-fi
+    def log_error(msg):
+        print("[WARN]", msg)
+        errors.append(msg)
 
-# Start a fresh report and error log for this run.
-if ! : > "$REPORT" || ! : > "$ERROR_LOG"; then
-    printf '[ERROR] Cannot write report files in %s\n' "$DEST" >&2
-    exit 1
-fi
+    # Start ADB and connect, then collect the package list. PhoneSploit itself
+    # uses ADB for device connection and option 36; this list is used to loop.
+    run(["adb", "start-server"])
+    con = run(["adb", "connect", device], timeout=15)
+    state = run(["adb", "-s", device, "get-state"], timeout=15)
+    if state.returncode != 0 or state.stdout.strip() != "device":
+        print(f"[ERROR] ADB device is not ready: {device}")
+        print((con.stdout + con.stderr + state.stdout + state.stderr).strip())
+        print("Enable/authorize wireless debugging and confirm the correct IP/port.")
+        return 1
 
-report() {
-    local line="$*"
-    printf '%s\n' "$line"
-    if ! printf '%s\n' "$line" >> "$REPORT"; then
-        printf '[WARN] Could not append to report file: %s\n' "$REPORT" >&2
-    fi
-}
+    pk = run(["adb", "-s", device, "shell", "pm", "list", "packages"], timeout=45)
+    packages = sorted({line.strip().removeprefix("package:") for line in pk.stdout.splitlines()
+                       if line.strip().startswith("package:")})
+    if pk.returncode != 0 or not packages:
+        print("[ERROR] Could not enumerate installed packages.")
+        print(pk.stderr.strip())
+        return 1
 
-log_error() {
-    local line="$*"
-    printf '[WARN] %s\n' "$line" >&2
-    if ! printf '%s\n' "$line" >> "$ERROR_LOG"; then
-        printf '[WARN] Could not append to error log: %s\n' "$ERROR_LOG" >&2
-    fi
-}
+    print(f"[INFO] Device connected: {device}")
+    print(f"[INFO] Packages discovered: {len(packages)}")
+    print(f"[INFO] PhoneSploit script: {ps_script}")
+    print(f"[INFO] Output directory: {out_dir}")
 
-cleanup_temp_files() {
-    # Only remove temporary files created by this run; completed APKs remain.
-    find "$APK_DIR" -maxdepth 1 -type f -name '*.part' -delete 2>/dev/null || true
-    rm -f "$DEST/packages_raw.tmp" "$DEST/packages_error.tmp" \
-          "$DEST/.paths.tmp" "$DEST/.pm_path_error.tmp" \
-          "$DEST/.paths.tmp.clean" 2>/dev/null || true
-}
-trap cleanup_temp_files EXIT
+    # Start PhoneSploit and drive its actual menu flow: connect (1), next page
+    # twice (n, n), then option 36. Do not shell-interpolate user-supplied data.
+    child = None
+    phone_sploit_ready = False
+    try:
+        child = pexpect.spawn(sys.executable, [str(ps_script)], cwd=str(ps_dir),
+                              encoding="utf-8", timeout=35)
+        child.delaybeforesend = 0.15
+        child.expect(r"Enter selection\s*>\s*")
+        child.sendline("1")
+        child.expect(r"Enter target phone's IP Address", timeout=20)
+        child.expect(r">\s*", timeout=10)
+        child.sendline(args.phone_ip)
+        child.expect(r"Enter selection\s*>\s*", timeout=30)
+        child.sendline("n")
+        child.expect(r"Enter selection\s*>\s*", timeout=20)
+        child.sendline("n")
+        child.expect(r"Enter selection\s*>\s*", timeout=20)
+        phone_sploit_ready = True
+        print("[INFO] PhoneSploit is connected and positioned on the page containing option 36.")
+    except Exception as exc:
+        log_error(f"Could not automate PhoneSploit menu: {exc}")
+        if child is not None:
+            try:
+                child.close(force=True)
+            except Exception:
+                pass
+        child = None
+        print("[WARN] Batch will continue using the same ADB extraction workflow; PhoneSploit menu automation was unavailable.")
 
-connect_device() {
-    local attempt state
-    for ((attempt=1; attempt<=MAX_RETRIES; attempt++)); do
-        adb connect "$DEVICE" >/dev/null 2>&1 || true
-        state="$(adb -s "$DEVICE" get-state 2>/dev/null || true)"
-        if [[ "$state" == "device" ]]; then
-            return 0
-        fi
-        log_error "ADB state '${state:-unavailable}' for $DEVICE (attempt $attempt/$MAX_RETRIES)."
-        sleep "$RETRY_DELAY"
-    done
-    return 1
-}
+    def phonesploit_extract_one(package, destination):
+        """Run option 36 -> manual package mode for one single-APK package."""
+        nonlocal child, phone_sploit_ready
+        if child is None or not phone_sploit_ready:
+            return False, "PhoneSploit menu is not available"
+        try:
+            child.sendline("36")
+            child.expect(r"Enter selection\s*>\s*|Select from App List", timeout=15)
+            # In the known v1.52 menu, option 36 asks mode 1/2. If the prompt
+            # is the menu prompt, the menu state drifted and this attempt fails.
+            if "Select from App List" not in child.before and "Enter selection" in child.after:
+                return False, "Unexpected PhoneSploit menu state"
+            child.sendline("2")
+            child.expect(r"Enter package name", timeout=15)
+            child.expect(r">\s*", timeout=10)
+            child.sendline(package)
+            # The destination is requested only on the first successful call
+            # because PhoneSploit stores it in a global variable.
+            idx = child.expect([r"Enter location to save APK file", r"Enter selection\s*>\s*"], timeout=40)
+            if idx == 0:
+                child.expect(r">\s*", timeout=10)
+                child.sendline(str(destination))
+                child.expect(r"Enter selection\s*>\s*", timeout=45)
+            return True, ""
+        except Exception as exc:
+            try:
+                child.close(force=True)
+            except Exception:
+                pass
+            child = None
+            phone_sploit_ready = False
+            return False, str(exc)
 
-get_package_paths() {
-    local package="$1"
-    local output_file="$2"
-    local attempt
+    try:
+        for index, package in enumerate(packages, 1):
+            print(f"\n[{index}/{len(packages)}] {package}")
+            path_result = run(["adb", "-s", device, "shell", "pm", "path", package], timeout=25)
+            remote_paths = [line.strip().removeprefix("package:") for line in path_result.stdout.splitlines()
+                            if line.strip().startswith("package:")]
+            if path_result.returncode != 0 or not remote_paths:
+                msg = f"{package}: unable to obtain APK path"
+                log_error(msg)
+                rows.append((package, "-", "-", "NO_APK_PATH"))
+                counts["failed"] += 1
+                continue
 
-    : > "$output_file"
-    for ((attempt=1; attempt<=MAX_RETRIES; attempt++)); do
-        if adb -s "$DEVICE" shell pm path "$package" \
-            > "$DEST/.paths.tmp" 2> "$DEST/.pm_path_error.tmp"; then
-            tr -d '\r' < "$DEST/.paths.tmp" > "$DEST/.paths.tmp.clean" 2>/dev/null || true
-            if grep -q '^package:' "$DEST/.paths.tmp.clean" 2>/dev/null; then
-                sed -n 's/^package://p' "$DEST/.paths.tmp.clean" > "$output_file"
-                if [[ -s "$output_file" ]]; then
-                    return 0
-                fi
-            fi
-        fi
+            # PhoneSploit v1.52's option 36 assumes a single path named base.apk.
+            # Use it when safe; use per-path ADB pulls for split APKs so they do
+            # not cause every extraction to fail.
+            use_phone_sploit = len(remote_paths) == 1
+            if len(remote_paths) > 1:
+                counts["split_paths"] += 1
+                print(f"  [INFO] {len(remote_paths)} split/base APK paths; PhoneSploit option 36 only handles one path, using per-split fallback.")
+            if use_phone_sploit:
+                package_apk = apk_dir / f"{safe_name(package).replace('.', '_')}.apk"
+                # Option 36 writes base.apk in PhoneSploit's working directory,
+                # then renames it into its selected output directory.
+                ok, reason = phonesploit_extract_one(package, apk_dir)
+                if ok and package_apk.is_file() and package_apk.stat().st_size > 0:
+                    try:
+                        checksum = crc32_file(package_apk)
+                        size = package_apk.stat().st_size
+                        rows.append((package, remote_paths[0], str(package_apk), checksum))
+                        counts["ok"] += 1
+                        print(f"  CRC-32: {checksum}  ({size} bytes) [PhoneSploit option 36]")
+                        continue
+                    except OSError as exc:
+                        log_error(f"{package}: CRC failed: {exc}")
+                else:
+                    log_error(f"{package}: PhoneSploit option 36 extraction failed or output missing ({reason or 'no APK file'}); trying direct path fallback.")
+                # Avoid leaving a stale file being mistaken for a new download.
+                try:
+                    package_apk.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
-        log_error "Could not obtain APK path for package '$package' (attempt $attempt/$MAX_RETRIES)."
-        connect_device || true
-        sleep "$RETRY_DELAY"
-    done
-    return 1
-}
+            # Split APK fallback, or retry when the PhoneSploit UI path fails.
+            for split_index, remote in enumerate(remote_paths, 1):
+                local = apk_dir / f"{safe_name(package)}_{split_index}_{safe_name(Path(remote).name)}"
+                try:
+                    pulled = run(["adb", "-s", device, "pull", remote, str(local)], timeout=90)
+                    with open(pull_log, "a", encoding="utf-8") as log:
+                        log.write(f"$ adb -s {device} pull {remote} {local}\n")
+                        log.write(pulled.stdout + pulled.stderr + "\n")
+                    if pulled.returncode != 0 or not local.is_file() or local.stat().st_size == 0:
+                        log_error(f"{package}: pull failed for {remote}")
+                        rows.append((package, remote, str(local), "PULL_FAILED"))
+                        counts["failed"] += 1
+                        local.unlink(missing_ok=True)
+                        continue
+                    checksum = crc32_file(local)
+                    rows.append((package, remote, str(local), checksum))
+                    counts["ok"] += 1
+                    print(f"  {Path(remote).name}: CRC-32 {checksum} [split/path fallback]")
+                except Exception as exc:
+                    log_error(f"{package}: error processing {remote}: {exc}")
+                    rows.append((package, remote, str(local), "ERROR"))
+                    counts["failed"] += 1
+                    try:
+                        local.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+    finally:
+        if child is not None:
+            try:
+                # Exit PhoneSploit cleanly from its menu.
+                child.sendline("0")
+                child.close(force=True)
+            except Exception:
+                pass
+        run(["adb", "disconnect", device], timeout=10)
 
-pull_apk() {
-    local remote="$1"
-    local destination="$2"
-    local part="${destination}.part"
-    local attempt
+    with report_path.open("w", encoding="utf-8") as report:
+        report.write("PhoneSploit Option-36 APK CRC-32 Report\n")
+        report.write(f"Device: {device}\nPackages discovered: {len(packages)}\n\n")
+        for package, remote, local, checksum in rows:
+            report.write(f"Package : {package}\nAPK path: {remote}\nLocal   : {local}\nCRC-32  : {checksum}\n")
+            report.write("-" * 60 + "\n")
+        report.write("\nSUMMARY\n")
+        report.write(f"Packages discovered: {len(packages)}\n")
+        report.write(f"APK files hashed: {counts['ok']}\n")
+        report.write(f"Failures: {counts['failed']}\n")
+        report.write(f"Packages with split paths: {counts['split_paths']}\n")
+        report.write(f"APK directory: {apk_dir}\n")
+    error_path.write_text("\n".join(errors) + ("\n" if errors else ""), encoding="utf-8")
 
-    rm -f "$part"
-    for ((attempt=1; attempt<=MAX_RETRIES; attempt++)); do
-        connect_device || true
-        rm -f "$part"
+    print("\n================ SUMMARY ================")
+    print(f"Packages discovered : {len(packages)}")
+    print(f"APK files hashed    : {counts['ok']}")
+    print(f"Failures            : {counts['failed']}")
+    print(f"Split-path packages : {counts['split_paths']}")
+    print(f"Report              : {report_path}")
+    print(f"Errors              : {error_path}")
+    print("=========================================")
+    return 0
 
-        printf '  Pull attempt %s/%s: %s\n' "$attempt" "$MAX_RETRIES" "$remote"
-        if adb -s "$DEVICE" pull "$remote" "$part"; then
-            if [[ -f "$part" && -s "$part" ]]; then
-                if mv -f "$part" "$destination"; then
-                    return 0
-                fi
-                log_error "Downloaded APK but could not move it to '$destination'."
-            else
-                log_error "ADB returned success but downloaded file was empty/missing: '$remote'."
-            fi
-        else
-            log_error "ADB pull failed for '$remote' (attempt $attempt/$MAX_RETRIES)."
-        fi
-
-        rm -f "$part"
-        sleep "$RETRY_DELAY"
-    done
-    return 1
-}
-
-calculate_crc32() {
-    local file="$1"
-    python3 - "$file" <<'PY'
-import sys, zlib
-crc = 0
-try:
-    with open(sys.argv[1], "rb") as f:
-        for block in iter(lambda: f.read(1024 * 1024), b""):
-            crc = zlib.crc32(block, crc)
-    print(f"{crc & 0xffffffff:08X}")
-except OSError as exc:
-    print(f"CRC_ERROR: {exc}", file=sys.stderr)
-    sys.exit(1)
-PY
-}
-
-adb start-server >/dev/null 2>&1 || true
-printf '[INFO] Connecting to %s ...\n' "$DEVICE"
-
-if ! connect_device; then
-    report 'ERROR: Could not connect to the Android device.'
-    report "Check IP, port $PORT, wireless debugging, and ADB authorization."
-    report "Partial/final report: $REPORT"
-    exit 1
-fi
-
-# Package enumeration is the one prerequisite for the loop. Retry it, and
-# stop only if no usable package list can be obtained at all.
-list_ok=false
-for ((attempt=1; attempt<=MAX_RETRIES; attempt++)); do
-    if adb -s "$DEVICE" shell pm list packages \
-        > "$DEST/packages_raw.tmp" 2> "$DEST/packages_error.tmp"; then
-        tr -d '\r' < "$DEST/packages_raw.tmp" |
-            sed -n 's/^package://p' > "$PACKAGES" 2>/dev/null || true
-        if [[ -s "$PACKAGES" ]]; then
-            list_ok=true
-            break
-        fi
-    fi
-    log_error "Could not retrieve a usable package list (attempt $attempt/$MAX_RETRIES)."
-    connect_device || true
-    sleep "$RETRY_DELAY"
-done
-
-if [[ "$list_ok" != true ]]; then
-    report 'ERROR: Could not retrieve installed packages; APK processing cannot start.'
-    report "See error log: $ERROR_LOG"
-    exit 1
-fi
-
-package_count="$(grep -c . "$PACKAGES" 2>/dev/null || true)"
-report '============================================================'
-report 'ANDROID APK CRC-32 REPORT'
-report "Device                    : $DEVICE"
-report "Installed packages listed : $package_count"
-report 'CRC-32 is calculated over each complete downloaded APK file.'
-report 'Split APKs are processed individually.'
-report '============================================================'
-report ''
-
-pkg_index=0
-paths_found=0
-apk_ok=0
-path_fail=0
-pull_fail=0
-crc_fail=0
-package_errors=0
-skipped_existing=0
-
-while IFS= read -r package || [[ -n "$package" ]]; do
-    [[ -n "$package" ]] || continue
-    pkg_index=$((pkg_index + 1))
-    printf '\n[PACKAGE %s/%s] %s\n' "$pkg_index" "$package_count" "$package"
-
-    package_failed=false
-    path_file="$DEST/.package_paths_${pkg_index}.tmp"
-
-    if ! get_package_paths "$package" "$path_file"; then
-        report "Package: $package | Status: NO_APK_PATH"
-        path_fail=$((path_fail + 1))
-        package_errors=$((package_errors + 1))
-        rm -f "$path_file"
-        continue
-    fi
-
-    mapfile -t remote_paths < "$path_file"
-    rm -f "$path_file"
-
-    if [[ ${#remote_paths[@]} -eq 0 ]]; then
-        report "Package: $package | Status: EMPTY_APK_PATH_LIST"
-        path_fail=$((path_fail + 1))
-        package_errors=$((package_errors + 1))
-        continue
-    fi
-
-    # Sanitize package and APK names so a remote path cannot affect local paths.
-    safe_package="$(printf '%s' "$package" | tr -c 'A-Za-z0-9._-' '_')"
-    split_index=0
-
-    for remote in "${remote_paths[@]}"; do
-        remote="${remote%$'\r'}"
-        [[ -n "$remote" ]] || continue
-        paths_found=$((paths_found + 1))
-        split_index=$((split_index + 1))
-
-        base="$(basename "$remote")"
-        safe_base="$(printf '%s' "$base" | tr -c 'A-Za-z0-9._-' '_')"
-        [[ -n "$safe_base" && "$safe_base" != "." && "$safe_base" != ".." ]] || safe_base="app.apk"
-        local_apk="$APK_DIR/${safe_package}_${split_index}_${safe_base}"
-
-        printf '  Remote APK: %s\n' "$remote"
-
-        # Always retrieve the current APK. This avoids calculating a CRC for a
-        # stale APK left from an earlier run. Failed transfers use .part and
-        # are deleted; a failed pull is recorded and this APK is skipped.
-        if ! pull_apk "$remote" "$local_apk"; then
-            report "Package: $package | APK: $remote | Status: PULL_FAILED"
-            pull_fail=$((pull_fail + 1))
-            package_failed=true
-            continue
-        fi
-
-        if ! crc="$(calculate_crc32 "$local_apk" 2> "$DEST/.crc_error.tmp")"; then
-            crc_detail="$(cat "$DEST/.crc_error.tmp" 2>/dev/null || true)"
-            report "Package: $package | APK: $remote | Status: CRC_FAILED"
-            log_error "CRC calculation failed for '$local_apk': ${crc_detail:-unknown error}"
-            crc_fail=$((crc_fail + 1))
-            package_failed=true
-            rm -f "$DEST/.crc_error.tmp"
-            continue
-        fi
-        rm -f "$DEST/.crc_error.tmp"
-
-        if [[ ! "$crc" =~ ^[0-9A-Fa-f]{8}$ ]]; then
-            report "Package: $package | APK: $remote | Status: CRC_FAILED_INVALID_OUTPUT"
-            log_error "CRC tool returned unexpected output for '$local_apk': '$crc'"
-            crc_fail=$((crc_fail + 1))
-            package_failed=true
-            continue
-        fi
-
-        size="$(wc -c < "$local_apk" 2>/dev/null | tr -d ' ' || true)"
-        size="${size:-unknown}"
-        report "Package : $package"
-        report "APK path: $remote"
-        report "Local   : $local_apk"
-        report "Size    : $size bytes"
-        report "CRC-32  : ${crc^^}"
-        report 'Status  : OK'
-        report '------------------------------------------------------------'
-        apk_ok=$((apk_ok + 1))
-    done
-
-    if [[ "$package_failed" == true ]]; then
-        package_errors=$((package_errors + 1))
-    fi
-done < "$PACKAGES"
-
-report ''
-report '========================== SUMMARY ========================='
-report "Installed packages listed : $package_count"
-report "Packages visited          : $pkg_index"
-report "APK paths returned        : $paths_found"
-report "APKs successfully hashed  : $apk_ok"
-report "Packages with path issues : $path_fail"
-report "APK pull failures         : $pull_fail"
-report "CRC calculation failures  : $crc_fail"
-report "Packages with other errors: $package_errors"
-report "Existing APKs reused      : 0 (fresh pulls required)"
-report "APK directory             : $APK_DIR"
-report "Readable text report      : $REPORT"
-report "Error log                 : $ERROR_LOG"
-report '============================================================'
-printf '\n[INFO] Processing finished. Failures for individual packages/APKs did not stop the loop.\n'
-printf '[INFO] Report: %s\n[INFO] Errors: %s\n' "$REPORT" "$ERROR_LOG"
-
-adb disconnect "$DEVICE" >/dev/null 2>&1 || true
-exit 0
+if __name__ == "__main__":
+    raise SystemExit(main())
