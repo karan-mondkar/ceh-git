@@ -9,6 +9,9 @@ usage() {
 Usage:
   ./android_apk_crc_phonesploit_only.sh [PhoneSploit-Pro-directory] [device-ip]
 
+Optional output folder override:
+  OUTPUT_DIR="/path/to/output" ./android_apk_crc_phonesploit_only.sh ...
+
 Example:
   ./android_apk_crc_phonesploit_only.sh "$HOME/PhoneSploit-Pro" 192.168.10.121
 
@@ -20,11 +23,15 @@ PS_DIR="${1:-$HOME/PhoneSploit-Pro}"
 DEVICE_IP="${2:-192.168.10.121}"
 PS_DIR="$(realpath -m "$PS_DIR")"
 PS_SCRIPT="$PS_DIR/phonesploitpro.py"
-DOWNLOAD_DIR="$PS_DIR/Downloaded-Files"
 SAFE_IP="${DEVICE_IP//[^A-Za-z0-9._-]/_}"
-OUT_DIR="$HOME/phonesploit_bash_crc_${SAFE_IP}"
+# Create a unique output folder beside this script so it is easy to find,
+# even if the script is launched from a different working directory.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+RUN_STAMP="$(date +%Y%m%d_%H%M%S)"
+OUT_DIR="${OUTPUT_DIR:-$SCRIPT_DIR/PhoneSploit_CRC32_${SAFE_IP}_${RUN_STAMP}}"
 APK_DIR="$OUT_DIR/apks"
 STAGING_DIR="$OUT_DIR/phonesploit_staging"
+LOG_DIR="$OUT_DIR/logs"
 REPORT="$OUT_DIR/crc32_report.txt"
 ERRORS="$OUT_DIR/errors.log"
 
@@ -46,7 +53,7 @@ if [[ ! "$DEVICE_IP" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
   exit 2
 fi
 
-mkdir -p "$APK_DIR" "$DOWNLOAD_DIR" "$STAGING_DIR"
+mkdir -p "$OUT_DIR" "$APK_DIR" "$STAGING_DIR" "$LOG_DIR"
 : > "$REPORT"
 : > "$ERRORS"
 
@@ -204,7 +211,8 @@ EXPECT_SCRIPT
   return 0
 }
 
-printf 'PhoneSploit menu-only APK CRC32 report\nDevice: %s\nStarted: %s\n\n' "$DEVICE_IP" "$(date -Is)" | tee -a "$REPORT"
+printf 'PhoneSploit menu-only APK CRC32 report\nDevice: %s\nStarted: %s\nOutput directory: %s\n\n' "$DEVICE_IP" "$(date -Is)" "$OUT_DIR" | tee -a "$REPORT"
+echo "[INFO] All output will be stored in: $OUT_DIR"
 
 success=0
 failures=0
@@ -214,7 +222,7 @@ for i in "${!PACKAGES[@]}"; do
   safe_package="${package//[^A-Za-z0-9._-]/_}"
   marker="$OUT_DIR/.before_${index}"
   dest="$APK_DIR/${safe_package}.apk"
-  session_log="$OUT_DIR/phonesploit_${index}.log"
+  session_log="$LOG_DIR/phonesploit_${index}.log"
   stage_dir="$STAGING_DIR/app_${index}"
   mkdir -p "$stage_dir"
   touch "$marker"
