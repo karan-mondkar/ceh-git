@@ -206,9 +206,14 @@ def main():
                 print(f"  [INFO] {len(remote_paths)} split/base APK paths; PhoneSploit option 36 only handles one path, using per-split fallback.")
             if use_phone_sploit:
                 package_apk = apk_dir / f"{safe_name(package).replace('.', '_')}.apk"
-                # Option 36 writes base.apk in PhoneSploit's working directory,
+                # Remove stale output so success can only refer to this attempt.
+                try:
+                    package_apk.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                # Option 36 asks for the full output filename, not just the directory.
                 # then renames it into its selected output directory.
-                ok, reason = phonesploit_extract_one(package, apk_dir)
+                ok, reason = phonesploit_extract_one(package, package_apk)
                 if ok and package_apk.is_file() and package_apk.stat().st_size > 0:
                     try:
                         checksum = crc32_file(package_apk)
