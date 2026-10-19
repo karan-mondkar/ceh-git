@@ -24,6 +24,7 @@ DOWNLOAD_DIR="$PS_DIR/Downloaded-Files"
 SAFE_IP="${DEVICE_IP//[^A-Za-z0-9._-]/_}"
 OUT_DIR="$HOME/phonesploit_bash_crc_${SAFE_IP}"
 APK_DIR="$OUT_DIR/apks"
+STAGING_DIR="$OUT_DIR/phonesploit_staging"
 REPORT="$OUT_DIR/crc32_report.txt"
 ERRORS="$OUT_DIR/errors.log"
 
@@ -45,7 +46,7 @@ if [[ ! "$DEVICE_IP" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
   exit 2
 fi
 
-mkdir -p "$APK_DIR" "$DOWNLOAD_DIR"
+mkdir -p "$APK_DIR" "$DOWNLOAD_DIR" "$STAGING_DIR"
 : > "$REPORT"
 : > "$ERRORS"
 
@@ -70,15 +71,18 @@ PY
 
 # One fresh PhoneSploit session per app keeps menu state predictable.
 extract_one() {
-  local index="$1" package="$2" destination="$3" marker="$4" log_file="$5"
+  local index="$1" package="$2" destination="$3" marker="$4" log_file="$5" stage_dir="$6"
+  mkdir -p "$stage_dir"
+  find "$stage_dir" -maxdepth 1 -type f -iname '*.apk' -delete
   PS_DIR_ENV="$PS_DIR" DEVICE_IP_ENV="$DEVICE_IP" APP_INDEX_ENV="$index" \
-  EXPECT_LOG_ENV="$log_file" expect <<'EXPECT_SCRIPT'
+  EXTRACT_DIR_ENV="$stage_dir" EXPECT_LOG_ENV="$log_file" expect <<'EXPECT_SCRIPT'
 set timeout 90
 log_user 1
 set psdir $env(PS_DIR_ENV)
 set ip $env(DEVICE_IP_ENV)
 set appindex $env(APP_INDEX_ENV)
 set logpath $env(EXPECT_LOG_ENV)
+set extractdir $env(EXTRACT_DIR_ENV)
 log_file -a $logpath
 
 proc wait_main {} {
@@ -170,16 +174,16 @@ send -- "$appindex\r"
 # Successful extraction asks for a save location; press Enter for the default directory.
 expect {
   -re {(?is)Enter location to save APK file} {
-    # PhoneSploit's prompt accepts a blank line for its default Downloaded-Files path.
-    send -- "\r"
+    # Use a dedicated user-writable staging directory instead of PhoneSploit's
+    # default Downloaded-Files directory, which may be unwritable or root-owned.
+    send -- "$extractdir\r"
+    exp_continue
   }
   -re {(?is)Extracting APK} {
     exp_continue
   }
-  -re {(?is)Main Menu} {
-    exp_continue
-  }
-  timeout { error "Timed out waiting for APK save-location prompt" }
+  -re {(?is)Main Menu} {}
+  timeout { error "Timed out waiting for APK extraction to finish" }
   eof { error "PhoneSploit exited before asking where to save the APK" }
 }
 # Wait until PhoneSploit finishes and returns to the main menu.
@@ -188,9 +192,9 @@ send -- "0\r"
 expect eof
 EXPECT_SCRIPT
 
-  # Find the newest APK changed since the marker was created.
+  # PhoneSploit was instructed to save into this per-app staging directory.
   local newest=""
-  newest="$(find "$DOWNLOAD_DIR" -type f -iname '*.apk' -newer "$marker" -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n1 | cut -d' ' -f2- || true)"
+  newest="$(find "$stage_dir" -maxdepth 1 -type f -iname '*.apk' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n1 | cut -d' ' -f2- || true)"
   if [[ -z "$newest" || ! -s "$newest" ]]; then
     echo "[FAIL] No newly created/updated APK found for $package" | tee -a "$ERRORS"
     return 1
@@ -211,10 +215,12 @@ for i in "${!PACKAGES[@]}"; do
   marker="$OUT_DIR/.before_${index}"
   dest="$APK_DIR/${safe_package}.apk"
   session_log="$OUT_DIR/phonesploit_${index}.log"
+  stage_dir="$STAGING_DIR/app_${index}"
+  mkdir -p "$stage_dir"
   touch "$marker"
   echo
   echo "[$index/${#PACKAGES[@]}] $package"
-  if extract_one "$index" "$package" "$dest" "$marker" "$session_log"; then
+  if extract_one "$index" "$package" "$dest" "$marker" "$session_log" "$stage_dir"; then
     checksum="$(crc32_file "$dest")"
     size="$(stat -c '%s' "$dest")"
     printf '[OK] CRC32=%s | size=%s bytes | file=%s\n' "$checksum" "$size" "$dest"
