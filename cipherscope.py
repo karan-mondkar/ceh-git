@@ -143,86 +143,122 @@ def printable_preview(data: bytes, limit: int = 96) -> str:
     return rendered + ("..." if len(data) > limit else "")
 
 def rank_candidates(data: bytes, filename: str, top: int = 0) -> list[tuple[float, str, list[str]]]:
-    """Return heuristic compatibility scores, not probabilities of the true algorithm."""
+    """Rank candidates by observable compatibility, never by invented probability.
+
+    Important: entropy and ciphertext length cannot distinguish well-designed modern
+    ciphers such as AES, Twofish, and Serpent. When evidence cannot discriminate,
+    this function intentionally gives candidates the same score.
+    """
     name = filename.lower()
     ent = entropy(data)
     n = len(data)
-    scores: dict[str, list] = {}
-
-    # All named CrypTool candidates are shown, even when evidence is neutral.
+    mode_variants = [
+        "DES (ECB)", "DES (CBC)", "Triple DES (ECB)", "Triple DES (CBC)",
+        "AES (CBC)", "AES (ECB)", "AES (CTR)", "Twofish (ECB)", "Twofish (CBC)",
+        "Serpent (ECB)", "Serpent (CBC)", "RC6 (ECB)", "RC6 (CBC)",
+    ]
     names = list(BLOCK_CIPHERS) + list(STREAM_CIPHERS) + CLASSICAL_CIPHERS + ASYMMETRIC_HYBRID
-    mode_variants = ["DES (ECB)", "DES (CBC)", "Triple DES (ECB)", "Triple DES (CBC)", "AES (CBC)", "AES (ECB)", "AES (CTR)"]
     names += mode_variants + ["AES (self-extracting)"]
-    for candidate in dict.fromkeys(names):
-        scores[candidate] = [18.0, ["Baseline only: ciphertext appearance alone cannot identify this algorithm."]]
+    names = list(dict.fromkeys(names))
+
+    # Start neutral. These are compatibility points, not probability percentages.
+    scores: dict[str, list] = {
+        candidate: [50.0, ["Neutral starting score; no algorithm-specific evidence yet."]]
+        for candidate in names
+    }
 
     def add(candidate: str, amount: float, reason: str) -> None:
         if candidate not in scores:
-            scores[candidate] = [18.0, ["Baseline only; insufficient evidence to distinguish this candidate."]]
+            scores[candidate] = [50.0, ["Neutral starting score; no algorithm-specific evidence yet."]]
         scores[candidate][0] += amount
         scores[candidate][1].append(reason)
 
-    if ent >= 7.6 and n >= 32:
-        for a in list(BLOCK_CIPHERS) + list(STREAM_CIPHERS) + mode_variants:
-            add(a, 8, f"High entropy ({ent:.2f}/8 bits per byte) is consistent with encryption or compression, but is not cipher-specific.")
-        for a in CLASSICAL_CIPHERS:
-            add(a, -3, "High entropy is less typical of ordinary classical-cipher output, though binary encodings can change this.")
-    elif ent < 5.5 and n > 0:
-        for a in CLASSICAL_CIPHERS:
-            add(a, 7, f"Lower entropy ({ent:.2f}/8) can be compatible with classical/text-oriented procedures; this is weak evidence.")
-        for a in list(BLOCK_CIPHERS) + list(STREAM_CIPHERS):
-            add(a, -2, "Lower entropy is less typical of modern ciphertext, but short files and encodings can mislead.")
+    modern = list(BLOCK_CIPHERS) + list(STREAM_CIPHERS) + mode_variants
+    classical = CLASSICAL_CIPHERS
+    if n == 0:
+        for candidate in names:
+            add(candidate, -30, "The analyzed payload is empty; there is no ciphertext evidence to assess.")
+    elif n < 32:
+        for candidate in modern:
+            add(candidate, 0, f"Short payload ({n} bytes): statistical measurements are too weak to discriminate modern ciphers.")
+    elif ent >= 7.2:
+        for candidate in modern:
+            add(candidate, 8, f"High entropy ({ent:.2f}/8) is consistent with encrypted or compressed bytes, but is not cipher-specific.")
+        for candidate in classical:
+            add(candidate, -5, "High byte entropy is less typical of ordinary text-oriented classical ciphertext; encoding can affect this clue.")
+    elif ent <= 5.0 and printable_ratio(data) > 0.65:
+        for candidate in classical:
+            add(candidate, 8, f"Low-to-moderate entropy ({ent:.2f}/8) and mostly printable bytes are compatible with text-oriented procedures, but not proof.")
+        for candidate in modern:
+            add(candidate, -4, "Mostly printable, low-entropy bytes are less typical of raw modern ciphertext; wrappers/encoding may explain this.")
     else:
-        for a in list(BLOCK_CIPHERS) + list(STREAM_CIPHERS) + mode_variants:
-            add(a, 3, f"Entropy ({ent:.2f}/8) is inconclusive and compatible with many binary payloads.")
+        for candidate in modern:
+            add(candidate, 2, f"Entropy ({ent:.2f}/8) is inconclusive and cannot distinguish modern algorithms.")
 
-    if re.search(r"twofish", name): add("Twofish", 45, "Filename explicitly contains 'Twofish'.")
-    if re.search(r"serpent", name): add("Serpent", 45, "Filename explicitly contains 'Serpent'.")
-    if re.search(r"idea", name): add("IDEA", 45, "Filename explicitly contains 'IDEA'.")
-    if re.search(r"rc2", name): add("RC2", 45, "Filename explicitly contains 'RC2'.")
-    if re.search(r"rc4", name): add("RC4", 45, "Filename explicitly contains 'RC4'.")
-    if re.search(r"mars", name): add("MARS", 45, "Filename explicitly contains 'MARS'.")
-    if re.search(r"rc6", name): add("RC6", 45, "Filename explicitly contains 'RC6'.")
-    if re.search(r"desxl", name): add("DESXL", 45, "Filename explicitly contains 'DESXL'.")
-    elif re.search(r"desl", name): add("DESL", 45, "Filename explicitly contains 'DESL'.")
-    elif re.search(r"desx", name): add("DESX", 45, "Filename explicitly contains 'DESX'.")
-    if re.search(r"(aes|rijndael)", name):
-        for a in ("AES", "AES (CBC)", "AES (ECB)", "AES (CTR)", "AES (self-extracting)", "RSA-AES Hybrid", "ECC-AES Hybrid"):
-            add(a, 30, "Filename explicitly mentions AES/Rijndael; this is a filename clue, not proof.")
-    if re.search(r"(3des|triple.?des)", name):
-        for a in ("Triple DES", "Triple DES (ECB)", "Triple DES (CBC)"):
-            add(a, 30, "Filename explicitly mentions Triple DES; this is a filename clue, not proof.")
-    if re.search(r"des", name):
-        for a in ("DES", "DES (ECB)", "DES (CBC)"):
-            add(a, 25, "Filename explicitly mentions DES; this does not distinguish ECB from CBC.")
-    if "128" in name:
-        for a in ("AES", "Twofish", "Serpent", "RC6", "MARS", "Camellia"):
-            add(a, 4, "Filename contains '128'; this may refer to key size but is only a weak clue.")
+    # Filename clues are deliberately modest. A key-size hint is not an algorithm ID.
+    explicit_patterns = [
+        (r"twofish", "Twofish", "Filename explicitly contains 'Twofish'."),
+        (r"serpent", "Serpent", "Filename explicitly contains 'Serpent'."),
+        (r"(?<![a-z0-9])idea(?![a-z0-9])", "IDEA", "Filename explicitly contains 'IDEA'."),
+        (r"(?<![a-z0-9])rc2(?![a-z0-9])", "RC2", "Filename explicitly contains 'RC2'."),
+        (r"(?<![a-z0-9])rc4(?![a-z0-9])", "RC4", "Filename explicitly contains 'RC4'."),
+        (r"(?<![a-z0-9])mars(?![a-z0-9])", "MARS", "Filename explicitly contains 'MARS'."),
+        (r"(?<![a-z0-9])rc6(?![a-z0-9])", "RC6", "Filename explicitly contains 'RC6'."),
+        (r"desxl", "DESXL", "Filename explicitly contains 'DESXL'."),
+        (r"desl", "DESL", "Filename explicitly contains 'DESL'."),
+        (r"desx", "DESX", "Filename explicitly contains 'DESX'."),
+    ]
+    for pattern, candidate, reason in explicit_patterns:
+        if re.search(pattern, name):
+            add(candidate, 18, reason + " Filename evidence is suggestive, not proof.")
 
-    # Alignment is a weak compatibility hint. Stream/classical/hybrid procedures don't require it.
+    if re.search(r"(?<![a-z0-9])aes(?![a-z0-9])|rijndael", name):
+        for candidate in ("AES", "AES (CBC)", "AES (ECB)", "AES (CTR)", "AES (self-extracting)", "RSA-AES Hybrid", "ECC-AES Hybrid"):
+            add(candidate, 18, "Filename mentions AES/Rijndael; this is suggestive, not proof.")
+    if re.search(r"3des|triple.?des", name):
+        for candidate in ("Triple DES", "Triple DES (ECB)", "Triple DES (CBC)"):
+            add(candidate, 18, "Filename mentions Triple DES; this is suggestive, not proof.")
+    elif re.search(r"(?<![a-z0-9])des(?![a-z0-9])", name):
+        for candidate in ("DES", "DES (ECB)", "DES (CBC)"):
+            add(candidate, 14, "Filename mentions DES but does not identify its mode.")
+
+    if re.search(r"(?<!\d)128(?!\d)", name):
+        for candidate in ("AES", "Twofish", "Serpent", "RC6", "MARS", "Camellia"):
+            add(candidate, 2, "Filename contains '128'; this may indicate key size, but many algorithms support 128-bit keys.")
+
+    # Block-length compatibility is reported, but it does not distinguish ciphers
+    # sharing the same block size and is not awarded as a cipher-identification bonus.
     for algo, info in BLOCK_CIPHERS.items():
         bs = info["block_bytes"]
-        if n >= bs and n % bs == 0:
-            add(algo, 4, f"Payload length ({n} bytes) is a multiple of the {bs}-byte block size; weak evidence only.")
-        for variant in mode_variants:
-            if variant.startswith(algo + " (") and n >= bs and n % bs == 0:
-                add(variant, 4, f"Payload length is aligned to {bs}-byte blocks; ECB/CBC still cannot be distinguished by length alone.")
-    for bs in (8, 16):
-        _, repeated_instances = repeated_block_stats(data, bs)
-        if repeated_instances:
-            related = ("DES", "Triple DES", "Blowfish", "IDEA", "RC2", "DESX", "DESL", "DESXL") if bs == 8 else ("AES", "Twofish", "Serpent", "MARS", "RC6", "Camellia")
-            for a in related:
-                add(a, 9, f"Found {repeated_instances} extra occurrence(s) of repeated {bs}-byte blocks; this can support an ECB/repeated-plaintext hypothesis, not prove it.")
-            for a in mode_variants:
-                if (bs == 8 and (a.startswith("DES (") or a.startswith("Triple DES ("))) or (bs == 16 and a.startswith("AES (")):
-                    if "ECB" in a: add(a, 12, "Repeated aligned blocks can be a clue for ECB mode; other explanations remain possible.")
+        if n and n % bs == 0:
+            add(algo, 0, f"Length is a multiple of the {bs}-byte block size; this is compatibility only, not identifying evidence.")
+    for variant in mode_variants:
+        if "ECB" in variant or "CBC" in variant:
+            bs = 8 if variant.startswith(("DES ", "Triple DES")) else 16
+            if n and n % bs == 0:
+                add(variant, 0, f"Length is compatible with {bs}-byte blocks; length alone cannot identify the cipher or mode.")
+            else:
+                add(variant, -8, f"Payload length is not a multiple of {bs} bytes. This weakly conflicts with raw {variant} ciphertext without a wrapper/header; formats may add metadata.")
 
-    # Convert raw evidence points to a bounded compatibility score. It is NOT a probability.
+    # Repeated blocks are only a modest clue for ECB-like handling. Do not apply it
+    # to every cipher indiscriminately, and do not infer that ECB must be in use.
+    for bs, related in (
+        (8, ["DES", "Triple DES", "Blowfish", "IDEA", "RC2", "DESX", "DESL", "DESXL", "DES (ECB)", "Triple DES (ECB)" ]),
+        (16, ["AES", "Twofish", "Serpent", "MARS", "RC6", "Camellia", "AES (ECB)", "Twofish (ECB)", "Serpent (ECB)", "RC6 (ECB)"]),
+    ):
+        _, repeats = repeated_block_stats(data, bs)
+        if repeats:
+            for candidate in related:
+                add(candidate, 5 if "(ECB)" in candidate else 2,
+                    f"Observed {repeats} repeated block instance(s) at {bs} bytes; this can support an ECB hypothesis, not prove the algorithm.")
+
     ranked = []
     for candidate, (raw_score, reasons) in scores.items():
-        value = max(1, min(99, round(raw_score)))
+        value = max(0, min(100, round(raw_score)))
         ranked.append((value, candidate, list(dict.fromkeys(reasons))))
-    ranked.sort(key=lambda x: (-x[0], x[1]))
+    # Stable alphabetical ordering for ties makes it clear that equal scores are not
+    # meaningful ranks. The printed report explicitly calls out ties.
+    ranked.sort(key=lambda item: (-item[0], item[1].lower()))
     return ranked if top == 0 else ranked[:top]
 
 def try_decrypt(data: bytes, algorithm: str, mode: str, key: bytes, iv: Optional[bytes]) -> bytes:
@@ -285,16 +321,27 @@ def try_decrypt(data: bytes, algorithm: str, mode: str, key: bytes, iv: Optional
     elif alg == "twofish":
         if len(key) not in (16, 24, 32):
             raise ValueError("Twofish key must be 16, 24, or 32 bytes (128/192/256 bits).")
-        if mode_upper != "ECB":
-            raise ValueError("This optional Twofish backend currently supports ECB only; CBC needs a separate mode wrapper and IV.")
+        if mode_upper not in ("ECB", "CBC"):
+            raise ValueError("Twofish helper supports ECB and CBC.")
+        if mode_upper == "CBC" and (iv is None or len(iv) != 16):
+            raise ValueError("Twofish-CBC requires a 16-byte IV.")
         try:
             from twofish import Twofish
         except ImportError as exc:
             raise RuntimeError("Twofish backend missing. In a virtual environment, try: python3 -m pip install twofish") from exc
         if len(data) % 16:
-            raise ValueError("Twofish-ECB ciphertext length must be a multiple of 16 bytes.")
+            raise ValueError(f"Twofish-{mode_upper} ciphertext length must be a multiple of 16 bytes.")
         tf = Twofish(key)
-        return b"".join(tf.decrypt(data[i:i+16]) for i in range(0, len(data), 16))
+        blocks = []
+        previous = iv
+        for offset in range(0, len(data), 16):
+            block = data[offset:offset + 16]
+            plain_block = tf.decrypt(block)
+            if mode_upper == "CBC":
+                plain_block = bytes(a ^ b for a, b in zip(plain_block, previous))
+                previous = block
+            blocks.append(plain_block)
+        return b"".join(blocks)
     elif alg in ("chacha20", "salsa20"):
         try:
             from Crypto.Cipher import ChaCha20, Salsa20
@@ -314,7 +361,7 @@ def try_decrypt(data: bytes, algorithm: str, mode: str, key: bytes, iv: Optional
             cipher = Salsa20.new(key=key, nonce=iv)
         return cipher.decrypt(data)
     else:
-        raise ValueError("Manual decryption supports AES, DES, 3DES, Blowfish, Twofish (ECB via optional library), ChaCha20, and Salsa20.")
+        raise ValueError("Manual decryption supports AES, DES, 3DES, Blowfish, Twofish (ECB/CBC via optional library), ChaCha20, and Salsa20.")
     if len(data) % cipher.block_size != 0 and mode_upper in ("ECB", "CBC"):
         raise ValueError(f"Ciphertext length must be a multiple of {cipher.block_size} bytes for {mode_upper}.")
     return cipher.decrypt(data)
@@ -328,6 +375,7 @@ def main() -> int:
     parser.add_argument("--mode", default="CBC", choices=["ECB", "CBC", "CTR"], help="Mode for block-cipher decryption (default: CBC)")
     parser.add_argument("--iv-hex", help="Optional IV/nonce in hexadecimal")
     parser.add_argument("--output", help="Optional path to save decrypted bytes")
+    parser.add_argument("--expected-text", help="Optional expected plaintext text; validates a manual decryption attempt by exact byte match")
     args = parser.parse_args()
 
     if args.top < 0 or args.top > 100:
@@ -369,6 +417,7 @@ def main() -> int:
         print("[+] OpenSSL salted-data marker present; password/format details may still be needed.")
 
     print("\nCrypTool candidate compatibility scores (heuristic, NOT probabilities):")
+    print("Scores reflect compatibility with visible clues. Equal scores mean the clues cannot distinguish those candidates.")
     candidates = rank_candidates(data, path.name, args.top)
     for index, (score, algo, reasons) in enumerate(candidates, 1):
         print(f"\n{index}. {algo} — compatibility score: {score}/100 (NOT a probability)")
@@ -402,6 +451,13 @@ def main() -> int:
             print("\n[!] Decryption command completed, but output is NOT automatically proven correct.")
             print(f"Decrypted bytes       : {len(plaintext)}")
             print(f"Plaintext preview     : {printable_preview(plaintext, 160)}")
+            if args.expected_text is not None:
+                matches = plaintext == args.expected_text.encode("utf-8")
+                print(f"Expected-text check   : {'MATCH' if matches else 'NO MATCH'}")
+                if matches:
+                    print("[+] The decrypted bytes exactly match the supplied expected UTF-8 text.")
+                else:
+                    print("[!] This check failed; mode, key, IV, padding, or expected text may be wrong.")
             if args.output:
                 out = Path(args.output).expanduser()
                 out.write_bytes(plaintext)
@@ -415,6 +471,7 @@ def main() -> int:
 
     print("\nScore interpretation: values are heuristic compatibility scores, NOT statistical probabilities or calibrated chances.")
     print("A high score means only that the available clues fit; it does not verify the algorithm.")
+    print("For AES/Twofish/Serpent-like modern ciphers, generic ciphertext statistics usually cannot distinguish the true algorithm.")
     print("Some CrypTool entries are modes, procedures, or hybrid systems, not standalone ciphers.")
     print("Decryption requires the correct key/password and often an IV/nonce; only a subset has a backend here.")
     print("Encrypted and compressed data can look alike; the cipher, mode, IV/nonce, key derivation, and padding may be unknown.")
