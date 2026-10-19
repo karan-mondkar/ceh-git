@@ -108,7 +108,9 @@ def launch_and_connect(ps_script: Path, ps_dir: Path, phone_ip: str):
 def get_app_list(child) -> list[tuple[int, str]]:
     child.sendline("36")
     child.expect(APP_LIST_OPTION, timeout=20)
-    child.expect(MAIN_PROMPT, timeout=15)  # option 1/2 menu prompt
+    # The 1/2 submenu ends with a bare colored " > " prompt, not the
+    # Main Menu's "Enter selection >" prompt. Match the bare prompt here.
+    child.expect(r">\s*", timeout=15)
     child.sendline("1")
     child.expect(APP_PROMPT, timeout=45)
     apps = parse_app_list(child.before or "")
@@ -124,7 +126,8 @@ def extract_via_menu(child, app_number: int, package: str, download_dir: Path, o
     before = apk_snapshot(download_dir)
     child.sendline("36")
     child.expect(APP_LIST_OPTION, timeout=20)
-    child.expect(MAIN_PROMPT, timeout=15)
+    # PhoneSploit uses a bare prompt for the option 36 submenu.
+    child.expect(r">\s*", timeout=15)
     child.sendline("1")
     child.expect(APP_PROMPT, timeout=45)
     apps_now = parse_app_list(child.before or "")
