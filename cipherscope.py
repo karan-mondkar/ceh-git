@@ -1,22 +1,19 @@
-from pathlib import Path
 
-script = r'''#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
-CipherScope: offline file-format and ciphertext candidate analyzer.
+CipherScope: Offline file-type and encryption candidate analyzer.
 
 Usage:
-  python3 cipherscope.py FILE
-  python3 cipherscope.py FILE --top 4
-  python3 cipherscope.py FILE --key-hex HEXKEY --algorithm aes --mode CBC --iv-hex HEXIV
+    python3 cipherscope.py FILE
+    python3 cipherscope.py FILE --top 4
 
-Notes:
-- This is a heuristic assistant, not a definitive cipher detector.
-- Never run unknown decrypted output. It may contain arbitrary data.
-- Decryption attempts are optional and require PyCryptodome:
-    python3 -m pip install pycryptodome
-  On Kali/Parrot, prefer a virtual environment if pip blocks system installs.
+Optional decryption with a known key:
+    python3 cipherscope.py FILE --algorithm aes --mode CBC \
+        --key-hex HEXKEY --iv-hex HEXIV --output plaintext.bin
+
+This tool ranks plausible candidates. It cannot reliably identify a cipher
+from ciphertext alone.
 """
-from __future__ import annotations
 
 import argparse
 import base64
@@ -24,28 +21,29 @@ import binascii
 import math
 import re
 import sys
-import zlib
 from collections import Counter
 from pathlib import Path
-from typing import Optional
+
 
 BLOCK_CIPHERS = {
-    "AES": {"block_bytes": 16, "keys": [16, 24, 32]},
-    "DES": {"block_bytes": 8, "keys": [8]},
-    "3DES": {"block_bytes": 8, "keys": [16, 24]},
-    "Blowfish": {"block_bytes": 8, "keys": list(range(4, 57))},
-    "CAST-128": {"block_bytes": 8, "keys": list(range(5, 17))},
-    "IDEA": {"block_bytes": 8, "keys": [16]},
-    "Camellia": {"block_bytes": 16, "keys": [16, 24, 32]},
-    "SEED": {"block_bytes": 16, "keys": [16]},
-    "Twofish": {"block_bytes": 16, "keys": [16, 24, 32]},
-    "Serpent": {"block_bytes": 16, "keys": [16, 24, 32]},
+    "AES": (16, "128, 192, 256"),
+    "DES": (8, "64-bit representation / 56 effective"),
+    "3DES": (8, "112 or 168 effective"),
+    "Blowfish": (8, "32–448 variable"),
+    "CAST-128": (8, "40–128 variable"),
+    "IDEA": (8, "128"),
+    "Camellia": (16, "128, 192, 256"),
+    "SEED": (16, "128"),
+    "Twofish": (16, "128, 192, 256"),
+    "Serpent": (16, "128, 192, 256"),
 }
+
 STREAM_CIPHERS = {
-    "ChaCha20": {"keys": [32]},
-    "Salsa20": {"keys": [32]},
-    "RC4": {"keys": list(range(1, 257))},
+    "ChaCha20": "256",
+    "Salsa20": "256",
+    "RC4": "variable (obsolete/insecure)",
 }
+
 SIGNATURES = [
     (b"\x89PNG\r\n\x1a\n", "PNG image"),
     (b"\xff\xd8\xff", "JPEG image"),
@@ -59,316 +57,503 @@ SIGNATURES = [
     (b"BZh", "BZIP2 compressed data"),
     (b"\xfd7zXZ\x00", "XZ compressed data"),
     (b"SQLite format 3\x00", "SQLite database"),
-    (b"RIFF", "RIFF container (WAV/AVI/WebP depending on subtype)"),
+    (b"RIFF", "RIFF container"),
     (b"ID3", "MP3 audio"),
     (b"OggS", "Ogg container"),
     (b"\x7fELF", "ELF executable"),
     (b"MZ", "Windows PE/DOS executable"),
-    (b"-----BEGIN ", "PEM text (certificate/key or related object)"),
-    (b"Salted__", "OpenSSL salted encrypted data marker"),
+    (b"Salted__", "OpenSSL salted-data marker"),
 ]
 
-def entropy(data: bytes) -> float:
-    if not data:
-        return 0.0
-    counts = Counter(data)
-    n = len(data)
-    return -sum((count / n) * math.log2(count / n) for count in counts.values())
 
-def printable_ratio(data: bytes) -> float:
+def entropy(data):
+    """Calculate Shannon entropy in bits per byte."""
     if not data:
         return 0.0
-    printable = sum((32 <= b <= 126) or b in (9, 10, 13) for b in data)
+
+    counts = Counter(data)
+    size = len(data)
+
+    return -sum(
+        (count / size) * math.log2(count / size)
+        for count in counts.values()
+    )
+
+
+def printable_ratio(data):
+    """Return the fraction of printable bytes."""
+    if not data:
+        return 0.0
+
+    printable = sum(
+        (32 <= byte <= 126) or byte in (9, 10, 13)
+        for byte in data
+    )
+
     return printable / len(data)
 
-def try_decode_text(raw: bytes) -> tuple[bytes, list[str]]:
-    """Return likely payload bytes and decoding notes. Does not recursively decode arbitrarily."""
-    notes = []
+
+def decode_container(raw):
+    """Decode hexadecimal or Base64 text when it is clearly recognizable."""
     stripped = raw.strip()
-    # Hex text: allow whitespace and common separators, but require a substantial all-hex body.
+
+    # Hexadecimal text, allowing whitespace and common separators.
     compact = re.sub(rb"[\s:_-]", b"", stripped)
-    if compact and len(compact) >= 16 and len(compact) % 2 == 0 and re.fullmatch(rb"[0-9a-fA-F]+", compact):
+
+    if (
+        len(compact) >= 16
+        and len(compact) % 2 == 0
+        and re.fullmatch(rb"[0-9a-fA-F]+", compact)
+    ):
         try:
             decoded = bytes.fromhex(compact.decode("ascii"))
-            notes.append(f"Input appears to be hexadecimal text ({len(compact)} hex characters).")
-            return decoded, notes
+            return decoded, [
+                f"Decoded hexadecimal text ({len(compact)} hex characters)."
+            ]
         except ValueError:
             pass
-    # Base64: avoid classifying ordinary text as base64 by requiring alphabet/length and a valid decode.
-    try:
-        candidate = re.sub(rb"\s+", b"", stripped)
-        if len(candidate) >= 24 and len(candidate) % 4 == 0 and re.fullmatch(rb"[A-Za-z0-9+/]*={0,2}", candidate):
+
+    # Base64 text.
+    candidate = re.sub(rb"\s+", b"", stripped)
+
+    if (
+        len(candidate) >= 24
+        and len(candidate) % 4 == 0
+        and re.fullmatch(rb"[A-Za-z0-9+/]*={0,2}", candidate)
+    ):
+        try:
             decoded = base64.b64decode(candidate, validate=True)
+
             if decoded:
-                notes.append(f"Input appears to be Base64 text ({len(candidate)} characters).")
-                return decoded, notes
-    except (binascii.Error, ValueError):
-        pass
-    return raw, notes
+                return decoded, [
+                    f"Decoded Base64 text ({len(candidate)} characters)."
+                ]
 
-def repeated_block_stats(data: bytes, block_size: int) -> tuple[int, int]:
-    usable = len(data) - (len(data) % block_size)
-    blocks = [data[i:i+block_size] for i in range(0, usable, block_size)]
-    counts = Counter(blocks)
-    repeated_values = sum(1 for count in counts.values() if count > 1)
-    repeated_instances = sum(count - 1 for count in counts.values() if count > 1)
-    return repeated_values, repeated_instances
+        except (binascii.Error, ValueError):
+            pass
 
-def detect_signature(data: bytes) -> Optional[str]:
-    for signature, label in SIGNATURES:
-        if data.startswith(signature):
-            return label
+    return raw, []
+
+
+def preview(data, limit=100):
+    """Display printable bytes and replace other bytes with dots."""
+    sample = data[:limit]
+
+    result = "".join(
+        chr(byte) if 32 <= byte <= 126 else "."
+        for byte in sample
+    )
+
+    if len(data) > limit:
+        result += "..."
+
+    return result if data else "(empty)"
+
+
+def detect_signature(data):
+    """Identify common file signatures at the beginning of data."""
+    for magic, description in SIGNATURES:
+        if data.startswith(magic):
+            return description
+
     return None
 
-def printable_preview(data: bytes, limit: int = 96) -> str:
-    if not data:
-        return "(empty)"
-    sample = data[:limit]
-    rendered = "".join(chr(b) if (32 <= b <= 126) else "." for b in sample)
-    return rendered + ("..." if len(data) > limit else "")
 
-def rank_candidates(data: bytes, filename: str, top: int = 4) -> list[tuple[float, str, list[str]]]:
-    """Heuristic ranking only; length/alignment are weak clues, never proof."""
-    scores: dict[str, tuple[float, list[str]]] = {}
-    name = filename.lower()
-    ent = entropy(data)
-    n = len(data)
+def repeated_block_count(data, block_size):
+    """Count repeated aligned blocks, a possible clue for ECB-like data."""
+    usable_length = len(data) - len(data) % block_size
 
-    def add(algo: str, score: float, reason: str) -> None:
-        old_score, old_reasons = scores.get(algo, (0.0, []))
-        old_reasons.append(reason)
-        scores[algo] = (old_score + score, old_reasons)
+    blocks = [
+        data[index:index + block_size]
+        for index in range(0, usable_length, block_size)
+    ]
 
-    # High entropy suggests compressed/encrypted/random-like bytes, not a particular cipher.
-    if ent >= 7.6 and n >= 32:
-        for algo in ("AES", "ChaCha20", "Blowfish", "3DES"):
-            add(algo, 1.0, f"High byte entropy ({ent:.2f} bits/byte) is compatible with encrypted or compressed data; it does not identify a cipher.")
-    elif ent >= 6.5 and n >= 32:
-        for algo in ("AES", "Blowfish", "3DES", "Camellia"):
-            add(algo, 0.4, f"Moderately high byte entropy ({ent:.2f}) is compatible with many binary formats.")
+    counts = Counter(blocks)
+
+    return sum(
+        count - 1
+        for count in counts.values()
+        if count > 1
+    )
+
+
+def rank_candidates(data, filename, top=4):
+    """Rank candidates using weak clues, not statistical probabilities."""
+    scores = {}
+
+    def add(name, points, reason):
+        score, reasons = scores.get(name, (0.0, []))
+        reasons.append(reason)
+        scores[name] = (score + points, reasons)
+
+    size = len(data)
+    data_entropy = entropy(data)
+    lower_name = filename.lower()
+
+    # Entropy indicates randomness, not a particular algorithm.
+    if size >= 32 and data_entropy >= 7.6:
+        for algorithm in (
+            "AES", "ChaCha20", "Blowfish", "3DES", "Camellia"
+        ):
+            add(
+                algorithm,
+                1.0,
+                f"High entropy ({data_entropy:.2f}/8) is "
+                "compatible with encrypted or compressed data."
+            )
+
+    elif size >= 16 and data_entropy >= 6.2:
+        for algorithm in (
+            "AES", "Blowfish", "3DES", "Camellia", "ChaCha20"
+        ):
+            add(
+                algorithm,
+                0.5,
+                f"Relatively high entropy ({data_entropy:.2f}/8) "
+                "fits many binary formats."
+            )
+
     else:
-        for algo in ("AES", "ChaCha20", "Blowfish", "3DES"):
-            add(algo, 0.1, "Ciphertext remains possible, but entropy alone provides little support.")
+        for algorithm in ("AES", "ChaCha20", "Blowfish", "3DES"):
+            add(
+                algorithm,
+                0.1,
+                "Entropy provides little evidence for or against encryption."
+            )
 
-    # Filename hints should be weak signals only.
-    if re.search(r"128", name):
-        add("AES", 0.35, "Filename contains '128'; this could refer to a key size, but is not proof.")
-        add("Camellia", 0.15, "Filename contains '128'; this is only a weak clue and may mean something else.")
-    if re.search(r"(aes|rijndael)", name):
+    # Filename hints are weak clues, not proof.
+    if "128" in lower_name:
+        add(
+            "AES",
+            0.35,
+            "Filename contains '128'; it might refer to a key size."
+        )
+        add(
+            "Camellia",
+            0.15,
+            "Filename contains '128'; this is only a weak hint."
+        )
+
+    if re.search(r"aes|rijndael", lower_name):
         add("AES", 1.5, "Filename explicitly mentions AES/Rijndael.")
-    if re.search(r"(3des|triple.?des)", name):
+
+    if re.search(r"3des|triple.?des", lower_name):
         add("3DES", 1.5, "Filename explicitly mentions 3DES.")
-    if re.search(r"blowfish", name):
+
+    if "blowfish" in lower_name:
         add("Blowfish", 1.5, "Filename explicitly mentions Blowfish.")
-    if re.search(r"\bdes\b", name):
+
+    if re.search(r"(^|[^a-z])des([^a-z]|$)", lower_name):
         add("DES", 1.2, "Filename explicitly mentions DES.")
 
-    # Block alignment is a weak compatibility clue, not a reliable detector.
-    for algo, info in BLOCK_CIPHERS.items():
-        bs = info["block_bytes"]
-        if n >= bs and n % bs == 0:
-            add(algo, 0.25, f"Decoded length ({n} bytes) is a multiple of its {bs}-byte block size; this is weak evidence only.")
-        elif n >= bs:
-            add(algo, 0.0, f"Length is not aligned to its {bs}-byte block size; modes such as CTR can still produce arbitrary lengths.")
-    for algo in STREAM_CIPHERS:
-        add(algo, 0.2, "Stream ciphers can produce ciphertext of almost any length; length does not confirm this candidate.")
+    # Block alignment is compatible with some modes, but not conclusive.
+    for algorithm, (block_size, key_sizes) in BLOCK_CIPHERS.items():
+        if size >= block_size and size % block_size == 0:
+            add(
+                algorithm,
+                0.25,
+                f"Length ({size} bytes) aligns to "
+                f"{block_size}-byte blocks; weak clue only."
+            )
 
-    # Repeated aligned blocks can sometimes be informative for ECB-like data.
-    for bs in (8, 16):
-        repeated_values, repeated_instances = repeated_block_stats(data, bs)
-        if repeated_instances:
-            label = "DES/3DES/Blowfish or another 64-bit-block cipher" if bs == 8 else "AES/Camellia or another 128-bit-block cipher"
-            for algo in (("DES", "3DES", "Blowfish", "IDEA", "CAST-128") if bs == 8 else ("AES", "Camellia", "SEED", "Twofish", "Serpent")):
-                add(algo, 0.5, f"Repeated {bs}-byte aligned blocks were found ({repeated_instances} extra occurrence(s)); this can support ECB/repeated-plaintext hypotheses, but has many caveats.")
+    for algorithm in STREAM_CIPHERS:
+        add(
+            algorithm,
+            0.15,
+            "Stream ciphers support many ciphertext lengths; "
+            "length does not confirm this candidate."
+        )
+
+    # Repeated aligned blocks may be relevant to ECB-like encryption.
+    block_groups = [
+        (8, ("DES", "3DES", "Blowfish", "IDEA", "CAST-128")),
+        (16, ("AES", "Camellia", "SEED", "Twofish", "Serpent")),
+    ]
+
+    for block_size, algorithms in block_groups:
+        repeats = repeated_block_count(data, block_size)
+
+        if repeats:
+            for algorithm in algorithms:
+                add(
+                    algorithm,
+                    0.45,
+                    f"Found {repeats} repeated aligned "
+                    f"{block_size}-byte block occurrence(s); "
+                    "this is not proof of the algorithm."
+                )
 
     ranked = []
-    for algo, (score, reasons) in scores.items():
-        # Convert arbitrary heuristic score to a bounded presentation score, not a statistical probability.
-        confidence = min(95, round(100 * (1 - math.exp(-score / 2.2))))
-        ranked.append((confidence, algo, list(dict.fromkeys(reasons))))
-    ranked.sort(key=lambda item: item[0], reverse=True)
+
+    for algorithm, (score, reasons) in scores.items():
+        # Display score is a heuristic index, NOT a probability.
+        display_score = min(
+            99,
+            round(100 * (1 - math.exp(-score / 2.2)))
+        )
+
+        ranked.append(
+            (display_score, algorithm, list(dict.fromkeys(reasons)))
+        )
+
+    ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+
     return ranked[:top]
 
-def try_decrypt(data: bytes, algorithm: str, mode: str, key: bytes, iv: Optional[bytes]) -> bytes:
-    try:
-        from Crypto.Cipher import AES, DES, DES3, Blowfish, ChaCha20, Salsa20
-    except ImportError as exc:
-        raise RuntimeError("PyCryptodome is not installed. Install it in a virtual environment: python3 -m pip install pycryptodome") from exc
 
-    alg = algorithm.lower()
-    mode_upper = mode.upper()
-    if alg == "aes":
+def decrypt_known(data, algorithm, mode, key, iv):
+    """Attempt decryption when the algorithm, key and parameters are known."""
+    try:
+        from Crypto.Cipher import (
+            AES, DES, DES3, Blowfish, ChaCha20, Salsa20
+        )
+    except ImportError as exc:
+        raise RuntimeError(
+            "PyCryptodome is missing. Install it in a virtual environment "
+            "with: python3 -m pip install pycryptodome"
+        ) from exc
+
+    algorithm = algorithm.lower()
+    mode = mode.upper()
+
+    if algorithm == "aes":
         if len(key) not in (16, 24, 32):
-            raise ValueError("AES key must be 16, 24, or 32 bytes (128/192/256 bits).")
-        if mode_upper == "ECB":
+            raise ValueError("AES key must be 16, 24, or 32 bytes.")
+
+        if mode == "ECB":
             cipher = AES.new(key, AES.MODE_ECB)
-        elif mode_upper == "CBC":
+
+        elif mode == "CBC":
             if iv is None or len(iv) != 16:
                 raise ValueError("AES-CBC requires a 16-byte IV.")
+
             cipher = AES.new(key, AES.MODE_CBC, iv=iv)
-        elif mode_upper == "CTR":
-            if iv is None:
-                raise ValueError("AES-CTR requires a counter/nonce value; provide --iv-hex.")
-            # PyCryptodome treats this as the initial counter block when using nonce=b''.
-            cipher = AES.new(key, AES.MODE_CTR, nonce=b"", initial_value=int.from_bytes(iv, "big"))
+
+        elif mode == "CTR":
+            if iv is None or len(iv) != 16:
+                raise ValueError(
+                    "This AES-CTR helper expects a 16-byte initial "
+                    "counter supplied with --iv-hex."
+                )
+
+            cipher = AES.new(
+                key,
+                AES.MODE_CTR,
+                nonce=b"",
+                initial_value=int.from_bytes(iv, "big")
+            )
+
         else:
-            raise ValueError("Supported AES modes in this helper: ECB, CBC, CTR.")
-    elif alg in ("des", "3des", "tripledes"):
-        cls = DES if alg == "des" else DES3
-        bs = 8
-        if alg == "des" and len(key) != 8:
-            raise ValueError("DES key must be 8 bytes (64 bits including parity; 56 effective bits).")
-        if alg != "des" and len(key) not in (16, 24):
-            raise ValueError("3DES key must be 16 or 24 bytes.")
-        if mode_upper == "ECB":
-            cipher = cls.new(key, cls.MODE_ECB)
-        elif mode_upper == "CBC":
-            if iv is None or len(iv) != bs:
-                raise ValueError(f"{algorithm}-CBC requires an {bs}-byte IV.")
-            cipher = cls.new(key, cls.MODE_CBC, iv=iv)
+            raise ValueError("AES mode must be ECB, CBC, or CTR.")
+
+    elif algorithm in ("des", "3des", "blowfish"):
+        if algorithm == "des":
+            cipher_class, block_size = DES, 8
+
+            if len(key) != 8:
+                raise ValueError(
+                    "DES key must be 8 bytes (56 effective bits)."
+                )
+
+        elif algorithm == "3des":
+            cipher_class, block_size = DES3, 8
+
+            if len(key) not in (16, 24):
+                raise ValueError("3DES key must be 16 or 24 bytes.")
+
         else:
-            raise ValueError("Supported DES/3DES modes in this helper: ECB, CBC.")
-    elif alg == "blowfish":
-        if not 4 <= len(key) <= 56:
-            raise ValueError("Blowfish key must be 4–56 bytes.")
-        if mode_upper == "ECB":
-            cipher = Blowfish.new(key, Blowfish.MODE_ECB)
-        elif mode_upper == "CBC":
-            if iv is None or len(iv) != 8:
-                raise ValueError("Blowfish-CBC requires an 8-byte IV.")
-            cipher = Blowfish.new(key, Blowfish.MODE_CBC, iv=iv)
+            cipher_class, block_size = Blowfish, 8
+
+            if not 4 <= len(key) <= 56:
+                raise ValueError("Blowfish key must be 4–56 bytes.")
+
+        if mode == "ECB":
+            cipher = cipher_class.new(key, cipher_class.MODE_ECB)
+
+        elif mode == "CBC":
+            if iv is None or len(iv) != block_size:
+                raise ValueError(
+                    f"{algorithm.upper()}-CBC requires a "
+                    f"{block_size}-byte IV."
+                )
+
+            cipher = cipher_class.new(
+                key, cipher_class.MODE_CBC, iv=iv
+            )
+
         else:
-            raise ValueError("Supported Blowfish modes in this helper: ECB, CBC.")
-    elif alg in ("chacha20", "salsa20"):
+            raise ValueError(
+                f"{algorithm.upper()} supports ECB or CBC here."
+            )
+
+    elif algorithm in ("chacha20", "salsa20"):
         if len(key) != 32:
-            raise ValueError(f"{algorithm} key must be 32 bytes (256 bits).")
-        if alg == "chacha20":
-            if iv is None:
-                raise ValueError("ChaCha20 requires a nonce; provide --iv-hex.")
-            if len(iv) not in (8, 12, 24):
-                raise ValueError("ChaCha20 nonce length supported here: 8, 12, or 24 bytes depending on variant.")
+            raise ValueError(f"{algorithm} key must be 32 bytes.")
+
+        if iv is None:
+            raise ValueError(f"{algorithm} requires a nonce.")
+
+        if algorithm == "chacha20":
             cipher = ChaCha20.new(key=key, nonce=iv)
+
         else:
-            if iv is None or len(iv) != 8:
+            if len(iv) != 8:
                 raise ValueError("Salsa20 requires an 8-byte nonce.")
+
             cipher = Salsa20.new(key=key, nonce=iv)
+
         return cipher.decrypt(data)
+
     else:
-        raise ValueError("Manual decryption supports AES, DES, 3DES, Blowfish, ChaCha20, and Salsa20.")
-    if len(data) % cipher.block_size != 0 and mode_upper in ("ECB", "CBC"):
-        raise ValueError(f"Ciphertext length must be a multiple of {cipher.block_size} bytes for {mode_upper}.")
+        raise ValueError("Unsupported algorithm.")
+
+    if mode in ("ECB", "CBC") and len(data) % cipher.block_size:
+        raise ValueError(
+            f"Ciphertext length must be a multiple of "
+            f"{cipher.block_size} bytes for {mode}."
+        )
+
     return cipher.decrypt(data)
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="CipherScope: offline file-type and encryption-candidate analyzer")
-    parser.add_argument("file", help="Path to input file (binary, hex text, or Base64 text)")
-    parser.add_argument("--top", type=int, default=4, help="Number of ranked algorithm candidates to display (default: 4)")
-    parser.add_argument("--key-hex", help="Optional known key in hexadecimal for a manual decryption attempt")
-    parser.add_argument("--algorithm", choices=["aes", "des", "3des", "blowfish", "chacha20", "salsa20"], help="Algorithm for optional manual decryption")
-    parser.add_argument("--mode", default="CBC", choices=["ECB", "CBC", "CTR"], help="Mode for block-cipher decryption (default: CBC)")
-    parser.add_argument("--iv-hex", help="Optional IV/nonce in hexadecimal")
-    parser.add_argument("--output", help="Optional path to save decrypted bytes")
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Offline file and encryption candidate analyzer"
+    )
+
+    parser.add_argument(
+        "file",
+        help="Input file path (binary, hexadecimal text, or Base64 text)"
+    )
+
+    parser.add_argument(
+        "--top",
+        type=int,
+        default=4,
+        help="Number of candidate algorithms to display (1–20)"
+    )
+
+    parser.add_argument(
+        "--algorithm",
+        choices=["aes", "des", "3des", "blowfish", "chacha20", "salsa20"]
+    )
+
+    parser.add_argument(
+        "--mode",
+        choices=["ECB", "CBC", "CTR"],
+        default="CBC"
+    )
+
+    parser.add_argument("--key-hex", help="Known key in hexadecimal")
+    parser.add_argument("--iv-hex", help="Known IV/nonce in hexadecimal")
+    parser.add_argument("--output", help="Save decrypted bytes to this path")
+
     args = parser.parse_args()
 
-    if args.top < 1 or args.top > 20:
+    if not 1 <= args.top <= 20:
         parser.error("--top must be between 1 and 20")
 
-    path = Path(args.file).expanduser()
+    if args.key_hex and not args.algorithm:
+        parser.error("--key-hex requires --algorithm")
+
+    if args.algorithm and not args.key_hex:
+        parser.error("--algorithm requires --key-hex for decryption")
+
+    if args.output and not args.key_hex:
+        parser.error("--output requires a decryption attempt")
+
+    input_path = Path(args.file).expanduser()
+
     try:
-        raw = path.read_bytes()
+        raw = input_path.read_bytes()
     except OSError as exc:
-        print(f"[!] Cannot read input file: {exc}", file=sys.stderr)
+        print(
+            f"[ERROR] Cannot read '{input_path}': {exc}",
+            file=sys.stderr
+        )
         return 2
 
-    data, notes = try_decode_text(raw)
-    print("=" * 72)
-    print("CipherScope | Offline File & Cipher Candidate Analyzer")
-    print("=" * 72)
-    print(f"File                 : {path}")
-    print(f"Original file size   : {len(raw)} bytes")
-    print(f"Analyzed data size   : {len(data)} bytes")
-    print(f"Shannon entropy      : {entropy(data):.3f} bits/byte (maximum 8.0)")
-    print(f"Printable ratio      : {printable_ratio(data) * 100:.1f}%")
-    print(f"First bytes (hex)    : {data[:32].hex(' ') or '(empty)'}")
-    print(f"Preview              : {printable_preview(data)}")
+    data, notes = decode_container(raw)
+
+    print("=" * 68)
+    print("CipherScope | Offline File & Encryption Candidate Analyzer")
+    print("=" * 68)
+    print(f"File               : {input_path}")
+    print(f"Original size      : {len(raw)} bytes")
+    print(f"Analyzed data size : {len(data)} bytes")
+    print(f"Entropy            : {entropy(data):.3f} bits/byte (max 8.0)")
+    print(f"Printable bytes    : {printable_ratio(data) * 100:.1f}%")
+    print(f"First 32 bytes     : {data[:32].hex(' ') or '(empty)'}")
+    print(f"Preview            : {preview(data)}")
+
     for note in notes:
-        print(f"[i] {note}")
+        print(f"[INFO] {note}")
 
-    signature = detect_signature(data)
-    if signature:
-        print(f"\n[+] Recognized file signature: {signature}")
-    else:
-        print("\n[?] No recognized signature at the beginning of analyzed data.")
+    detected = detect_signature(data)
+    print(f"Signature          : {detected or 'No recognized signature'}")
 
-    # Try safe decompression checks; only report success if decoder accepts stream.
-    if data.startswith(b"\x1f\x8b"):
-        print("[+] GZIP signature present.")
-    if data.startswith(b"PK\x03\x04"):
-        print("[+] ZIP-family signature present.")
     if data.startswith(b"Salted__"):
-        print("[+] OpenSSL salted-data marker present; password/format details may still be needed.")
+        print(
+            "[INFO] OpenSSL salted-data marker found; "
+            "additional password/cipher details may be required."
+        )
 
-    print("\nTop algorithm candidates (heuristic, NOT probabilities):")
-    candidates = rank_candidates(data, path.name, args.top)
-    for index, (score, algo, reasons) in enumerate(candidates, 1):
-        print(f"\n{index}. {algo} — heuristic score: {score}/100")
+    print("\nTop candidates (heuristic scores, NOT probabilities):")
+
+    for index, (score, algorithm, reasons) in enumerate(
+        rank_candidates(data, input_path.name, args.top), 1
+    ):
+        print(f"\n{index}. {algorithm} — heuristic score {score}/100")
+
         for reason in reasons[:4]:
             print(f"   - {reason}")
-        info = BLOCK_CIPHERS.get(algo) or STREAM_CIPHERS.get(algo)
-        if info:
-            if "block_bytes" in info:
-                print(f"   - Block size: {info['block_bytes'] * 8} bits")
-            key_sizes = info["keys"]
-            if algo == "Blowfish":
-                print("   - Supported key sizes: 32–448 bits (implementation constraints apply)")
-            elif algo == "RC4":
-                print("   - Key sizes: variable; not recommended for modern security")
-            elif algo in ("DES", "3DES"):
-                if algo == "DES":
-                    print("   - Key size: 64-bit key representation; 56 effective key bits")
-                else:
-                    print("   - Keying options commonly use 112 or 168 effective bits")
-            else:
-                print("   - Key sizes: " + ", ".join(str(size * 8) for size in key_sizes) + " bits")
+
+        if algorithm in BLOCK_CIPHERS:
+            block_size, key_sizes = BLOCK_CIPHERS[algorithm]
+            print(f"   - Block size: {block_size * 8} bits")
+            print(f"   - Key size(s): {key_sizes} bits")
+
+        elif algorithm in STREAM_CIPHERS:
+            print(f"   - Key size: {STREAM_CIPHERS[algorithm]} bits")
 
     if args.key_hex:
-        if not args.algorithm:
-            parser.error("--key-hex requires --algorithm")
         try:
             key = bytes.fromhex(args.key_hex)
             iv = bytes.fromhex(args.iv_hex) if args.iv_hex else None
-            plaintext = try_decrypt(data, args.algorithm, args.mode, key, iv)
-            print("\n[!] Decryption command completed, but output is NOT automatically proven correct.")
-            print(f"Decrypted bytes       : {len(plaintext)}")
-            print(f"Plaintext preview     : {printable_preview(plaintext, 160)}")
+
+            plaintext = decrypt_known(
+                data, args.algorithm, args.mode, key, iv
+            )
+
+            print(
+                "\n[!] Decryption completed, but the output "
+                "is not automatically verified."
+            )
+            print(f"Decrypted size     : {len(plaintext)} bytes")
+            print(f"Preview            : {preview(plaintext, 160)}")
+
             if args.output:
-                out = Path(args.output).expanduser()
-                out.write_bytes(plaintext)
-                print(f"Saved decrypted data  : {out}")
-            else:
-                print("No output file saved. Use --output decrypted.bin to save the bytes.")
-            print("Validate the result by checking known text, file signatures, padding, or challenge-specific format.")
-        except (ValueError, RuntimeError) as exc:
-            print(f"[!] Decryption attempt failed: {exc}", file=sys.stderr)
+                output_path = Path(args.output).expanduser()
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_bytes(plaintext)
+                print(f"Saved output       : {output_path}")
+
+            print(
+                "Validate the result using expected text, "
+                "a file signature, or challenge clues."
+            )
+
+        except (ValueError, RuntimeError, OSError) as exc:
+            print(f"[ERROR] Decryption failed: {exc}", file=sys.stderr)
             return 3
 
-    print("\nImportant: encrypted/compressed data can look alike. Candidate ranking is heuristic;")
-    print("cipher, mode, IV/nonce, key/password derivation, and padding may be unknown.")
+    print(
+        "\nNote: ciphertext alone usually cannot identify the exact "
+        "cipher, mode, key, or padding."
+    )
+
     return 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main())
-'''
-
-path = Path("/mnt/data/cipherscope.py")
-path.write_text(script, encoding="utf-8")
-# Verify syntax and basic behavior on a temporary hex-text sample.
-import py_compile, subprocess, tempfile, os
-py_compile.compile(str(path), doraise=True)
-sample = Path("/mnt/data/cipherscope_sample.hex")
-sample.write_text("48656c6c6f20776f726c64212054686973206973206120746573742066696c652e", encoding="ascii")
-run = subprocess.run(["python3", str(path), str(sample), "--top", "4"], capture_output=True, text=True)
-print("Created:", path)
-print("Syntax check: passed")
-print("Smoke test exit code:", run.returncode)
-print("\n".join(run.stdout.splitlines()[:22]))
