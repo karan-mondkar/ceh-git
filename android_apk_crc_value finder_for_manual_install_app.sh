@@ -20,7 +20,20 @@ USAGE
 }
 
 PS_DIR="${1:-$HOME/PhoneSploit-Pro}"
-DEVICE_IP="${2:-192.168.10.121}"
+DEVICE_IP="${2:-}"
+
+if [[ -z "$DEVICE_IP" ]]; then
+  read -r -p "Enter target device IPv4 address: " DEVICE_IP || {
+    echo "[ERROR] Failed to read device IP." >&2
+    exit 2
+  }
+fi
+
+if [[ -z "$DEVICE_IP" ]]; then
+  echo "[ERROR] Device IP address cannot be empty." >&2
+  exit 2
+fi
+
 PS_DIR="$(realpath -m "$PS_DIR")"
 PS_SCRIPT="$PS_DIR/phonesploitpro.py"
 SAFE_IP="${DEVICE_IP//[^A-Za-z0-9._-]/_}"
